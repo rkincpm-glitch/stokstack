@@ -41,6 +41,7 @@ export default function AdminUsersPage() {
 
   useEffect(() => {
     loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadData = async () => {
@@ -154,7 +155,14 @@ export default function AdminUsersPage() {
   };
 
   const handleToggleActive = async (row: ProfileRow) => {
-    // Soft delete / disable
+    if (!authProfile) return;
+
+    // 🚫 Prevent admin from disabling their own account
+    if (row.id === authProfile.id && row.is_active) {
+      setErrorMsg("You cannot disable your own admin account.");
+      return;
+    }
+
     const next = !row.is_active;
 
     try {
@@ -353,6 +361,8 @@ export default function AdminUsersPage() {
               <tbody>
                 {rows.map((row) => {
                   const inactive = !row.is_active;
+                  const isSelf = row.id === authProfile.id;
+
                   return (
                     <tr
                       key={row.id}
@@ -404,16 +414,17 @@ export default function AdminUsersPage() {
                         <button
                           type="button"
                           onClick={() => handleToggleActive(row)}
+                          disabled={isSelf && row.is_active}
                           className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] ${
                             row.is_active
-                              ? "bg-red-50 text-red-700 hover:bg-red-100"
+                              ? "bg-red-50 text-red-700 hover:bg-red-100 disabled:bg-red-50 disabled:text-red-300"
                               : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                           }`}
                         >
                           {row.is_active ? (
                             <>
                               <Ban className="w-3 h-3" />
-                              Disable
+                              {isSelf ? "Cannot disable self" : "Disable"}
                             </>
                           ) : (
                             <>
