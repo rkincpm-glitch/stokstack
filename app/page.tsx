@@ -91,6 +91,7 @@ export default function Dashboard() {
     loadData();
   }, []);
 
+  // 🔧 UPDATED: shared inventory + location-based access via user_locations
   const loadData = async () => {
     setLoading(true);
 
@@ -102,31 +103,71 @@ export default function Dashboard() {
 
     const userId = userData.user.id;
 
-    const [
-      { data: itemsData, error: itemsError },
-      { data: categoriesData, error: categoriesError },
-      { data: locationsData, error: locationsError },
-    ] = await Promise.all([
-      supabase
-        .from("items")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false }),
-      supabase
-        .from("categories")
-        .select("*")
-        .eq("user_id", userId)
-        .order("name", { ascending: true }),
-      supabase
-        .from("locations")
-        .select("*")
-        .eq("user_id", userId)
-        .order("name", { ascending: true }),
-    ]);
+    // 1) Load all locations (shared master data)
+    const { data: locationsData, error: locationsError } = await supabase
+      .from("locations")
+      .select("*")
+      .order("name", { ascending: true });
 
-    if (itemsError) console.error("Items error:", itemsError);
-    if (categoriesError) console.error("Categories error:", categoriesError);
-    if (locationsError) console.error("Locations error:", locationsError);
+    if (locationsError) {
+      console.error("Locations error:", locationsError);
+    }
+
+    // 2) Load this user's location access
+    const { data: accessData, error: accessError } = await supabase
+      .from("user_locations")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (accessError) {
+      console.error("User location access error:", accessError);
+    }
+
+    // 3) Determine allowed locations for this user
+    // - If user has a row with all_locations = true -> can see everything
+    // - If user has no rows -> can see everything (default "open" behaviour)
+    // - Else -> only items whose location is in this list
+    let allowedLocations: string[] | "ALL" = "ALL";
+
+    if (accessData && accessData.length > 0) {
+      const hasAll = accessData.some((a: any) => a.all_locations);
+      if (!hasAll) {
+        const locSet = new Set<string>();
+        accessData.forEach((a: any) => {
+          if (a.location_name) locSet.add(a.location_name);
+        });
+        const list = Array.from(locSet);
+        allowedLocations = list.length > 0 ? list : "ALL";
+      }
+    }
+
+    // 4) Load items based on allowed locations (shared inventory)
+    let itemsQuery = supabase
+      .from("items")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (allowedLocations !== "ALL") {
+      itemsQuery = itemsQuery.in("location", allowedLocations);
+    }
+
+    const { data: itemsData, error: itemsError } = await itemsQuery;
+
+    if (itemsError) {
+      console.error("Items error:", itemsError);
+    }
+
+    // 5) Load categories (shared master data)
+    const { data: categoriesData, error: categoriesError } = await supabase
+      .from("categories")
+      .select("*")
+      .order("name", { ascending: true });
+
+    if (categoriesError) {
+      console.error("Categories error:", categoriesError);
+    }
+
+    // 6) Apply to state
 
     setItems((itemsData || []) as Item[]);
 
@@ -140,7 +181,7 @@ export default function Dashboard() {
     });
     setCategoryOptions(Array.from(categorySet).sort());
 
-    // Build location options
+    // Build location options (from master + items)
     const locationSet = new Set<string>();
     (locationsData as LocationRow[] | null)?.forEach((l) => {
       if (l.name) locationSet.add(l.name);
@@ -407,12 +448,12 @@ export default function Dashboard() {
               Reports
             </Link>
             <Link
-  href="/purchase-requests"
-  className="flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
->
-  <Package className="w-5 h-5" />
-  Purchasing
-</Link>
+              href="/purchase-requests"
+              className="flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
+            >
+              <Package className="w-5 h-5" />
+              Purchasing
+            </Link>
           </div>
 
           {showFilters && (
