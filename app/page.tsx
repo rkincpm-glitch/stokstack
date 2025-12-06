@@ -24,6 +24,7 @@ import {
   Edit,
   X,
   CheckCircle2,
+  Users, // 👈 added
 } from "lucide-react";
 
 type Item = {
@@ -62,6 +63,12 @@ type StockVerification = {
   verified_by: string | null;
 };
 
+type Profile = {
+  id: string;
+  role: string;
+  display_name: string | null;
+};
+
 export default function Dashboard() {
   const router = useRouter();
   const [items, setItems] = useState<Item[]>([]);
@@ -87,11 +94,14 @@ export default function Dashboard() {
   const [verifyNotes, setVerifyNotes] = useState("");
   const [savingVerification, setSavingVerification] = useState(false);
 
+  // 👇 current user's profile (so we know if they're admin)
+  const [profile, setProfile] = useState<Profile | null>(null);
+
   useEffect(() => {
     loadData();
   }, []);
 
-  // 🔧 UPDATED: shared inventory + location-based access via user_locations
+  // Shared inventory + location-based access + profile
   const loadData = async () => {
     setLoading(true);
 
@@ -102,8 +112,38 @@ export default function Dashboard() {
     }
 
     const userId = userData.user.id;
+    const email = userData.user.email || null;
 
-    // 1) Load all locations (shared master data)
+    // 1) Ensure this user has a profile (role + display name)
+    let { data: profData, error: profError } = await supabase
+      .from("profiles")
+      .select("id, role, display_name")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (!profData && !profError) {
+      // create default requester profile
+      const { data: newProf } = await supabase
+        .from("profiles")
+        .insert({
+          id: userId,
+          role: "requester",
+          display_name: email,
+        })
+        .select()
+        .single();
+      profData = newProf;
+    }
+
+    if (profData) {
+      setProfile({
+        id: profData.id,
+        role: profData.role || "requester",
+        display_name: profData.display_name || email,
+      });
+    }
+
+    // 2) Load all locations (shared master data)
     const { data: locationsData, error: locationsError } = await supabase
       .from("locations")
       .select("*")
@@ -113,7 +153,7 @@ export default function Dashboard() {
       console.error("Locations error:", locationsError);
     }
 
-    // 2) Load this user's location access
+    // 3) Load this user's location access from user_locations
     const { data: accessData, error: accessError } = await supabase
       .from("user_locations")
       .select("*")
@@ -123,10 +163,10 @@ export default function Dashboard() {
       console.error("User location access error:", accessError);
     }
 
-    // 3) Determine allowed locations for this user
-    // - If user has a row with all_locations = true -> can see everything
-    // - If user has no rows -> can see everything (default "open" behaviour)
-    // - Else -> only items whose location is in this list
+    // 4) Determine allowed locations
+    // - If all_locations = true exists → ALL
+    // - If no rows at all → ALL (default open)
+    // - Else → only items with location in that list
     let allowedLocations: string[] | "ALL" = "ALL";
 
     if (accessData && accessData.length > 0) {
@@ -141,7 +181,7 @@ export default function Dashboard() {
       }
     }
 
-    // 4) Load items based on allowed locations (shared inventory)
+    // 5) Load items based on allowed locations (shared inventory)
     let itemsQuery = supabase
       .from("items")
       .select("*")
@@ -157,7 +197,7 @@ export default function Dashboard() {
       console.error("Items error:", itemsError);
     }
 
-    // 5) Load categories (shared master data)
+    // 6) Load categories (shared master data)
     const { data: categoriesData, error: categoriesError } = await supabase
       .from("categories")
       .select("*")
@@ -167,8 +207,7 @@ export default function Dashboard() {
       console.error("Categories error:", categoriesError);
     }
 
-    // 6) Apply to state
-
+    // 7) Apply to state
     setItems((itemsData || []) as Item[]);
 
     // Build category options (prefer master tables, fall back to items)
@@ -291,11 +330,24 @@ export default function Dashboard() {
               </div>
               <div>
                 <h1 className="text-xl font-bold text-slate-900">StokStack</h1>
-                <p className="text-xs text-slate-500">Inventory Management</p>
+                <p className="text-xs text-slate-500">
+                  Inventory & Purchasing
+                </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
+              {/* 👇 Show User Management link when logged-in user is admin */}
+              {profile?.role === "admin" && (
+                <Link
+                  href="/admin/users"
+                  className="hidden sm:flex items-center gap-2 px-3 py-2 border rounded-lg text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  <Users className="w-4 h-4" />
+                  Manage Users
+                </Link>
+              )}
+
               <Link
                 href="/add-item"
                 className="hidden sm:flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
@@ -314,17 +366,34 @@ export default function Dashboard() {
                   className="flex items-center gap-2 p-2 hover:bg-slate-100 rounded-lg"
                 >
                   <div className="w-8 h-8 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white text-sm font-medium">
-                    U
+                    {profile?.display_name?.[0]?.toUpperCase() || "U"}
                   </div>
                   <ChevronDown className="w-4 h-4 text-slate-600" />
                 </button>
 
                 {showUserMenu && (
-                  <div className="absolute right-0 mt-2 w-48 bg-white rounded-lg shadow-lg border py-1">
-                    <button className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex gap-2">
-                      <Settings className="w-4 h-4" />
-                      Settings
-                    </button>
+                  <div className="absolute right-0 mt-2 w-52 bg-white rounded-lg shadow-lg border py-1">
+                    <div className="px-4 py-2 text-xs text-slate-500 border-b">
+                      {profile?.display_name
+                        ? `Signed in as ${profile.display_name}`
+                        : "Signed in"}
+                      {profile?.role && (
+                        <span className="block text-[11px] text-slate-400">
+                          Role: {profile.role}
+                        </span>
+                      )}
+                    </div>
+
+                    {profile?.role === "admin" && (
+                      <Link
+                        href="/admin/users"
+                        className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex gap-2 items-center"
+                      >
+                        <Users className="w-4 h-4" />
+                        Manage users
+                      </Link>
+                    )}
+
                     <button
                       onClick={handleLogout}
                       className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex gap-2"
@@ -790,7 +859,6 @@ export default function Dashboard() {
                     <CheckCircle2 className="w-5 h-5 text-emerald-600" />
                     Stock Verification
                   </h3>
-                  {/* Optional: could add a link to a verification report page later */}
                 </div>
 
                 {/* Verification Form */}
