@@ -4,12 +4,19 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
-import { ArrowLeft, Users, Save } from "lucide-react";
+import {
+  ArrowLeft,
+  Users,
+  Save,
+  Ban,
+  RotateCcw,
+} from "lucide-react";
 
 type ProfileRow = {
   id: string;
   display_name: string | null;
   role: string;
+  is_active: boolean;
 };
 
 const ROLE_OPTIONS = [
@@ -53,7 +60,7 @@ export default function AdminUsersPage() {
     // 1) Ensure current user has a profile
     let { data: prof, error: profError } = await supabase
       .from("profiles")
-      .select("id, role, display_name")
+      .select("id, role, display_name, is_active")
       .eq("id", userId)
       .maybeSingle();
 
@@ -65,8 +72,9 @@ export default function AdminUsersPage() {
           id: userId,
           role: "requester",
           display_name: email,
+          is_active: true,
         })
-        .select()
+        .select("id, role, display_name, is_active")
         .single();
       prof = newProf;
     }
@@ -80,7 +88,7 @@ export default function AdminUsersPage() {
     // 2) Load all profiles
     const { data: allProfiles, error: allError } = await supabase
       .from("profiles")
-      .select("id, role, display_name, created_at")
+      .select("id, role, display_name, is_active, created_at")
       .order("created_at", { ascending: true });
 
     if (allError) {
@@ -110,8 +118,9 @@ export default function AdminUsersPage() {
 
     const currentProfile: ProfileRow = {
       id: prof.id,
-      role: prof.role,
+      role: prof.role || "requester",
       display_name: prof.display_name || email,
+      is_active: prof.is_active ?? true,
     };
     setAuthProfile(currentProfile);
 
@@ -125,6 +134,7 @@ export default function AdminUsersPage() {
       id: p.id,
       role: p.role,
       display_name: p.display_name || p.id,
+      is_active: p.is_active ?? true,
     }));
 
     setRows(rowsNormalized);
@@ -143,6 +153,33 @@ export default function AdminUsersPage() {
     );
   };
 
+  const handleToggleActive = async (row: ProfileRow) => {
+    // Soft delete / disable
+    const next = !row.is_active;
+
+    try {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ is_active: next })
+        .eq("id", row.id);
+
+      if (error) {
+        console.error(error);
+        setErrorMsg("Error updating active status.");
+        return;
+      }
+
+      setRows((prev) =>
+        prev.map((r) =>
+          r.id === row.id ? { ...r, is_active: next } : r
+        )
+      );
+    } catch (err) {
+      console.error(err);
+      setErrorMsg("Error updating active status.");
+    }
+  };
+
   const handleSave = async () => {
     setSaveStatus("saving");
     setErrorMsg(null);
@@ -154,6 +191,7 @@ export default function AdminUsersPage() {
           .update({
             role: row.role,
             display_name: row.display_name,
+            is_active: row.is_active,
           })
           .eq("id", row.id);
       }
@@ -197,7 +235,7 @@ export default function AdminUsersPage() {
           </div>
         </header>
         <main className="max-w-4xl mx-auto px-4 py-6">
-          <div className="bg-white rounded-2xlshadow-sm border p-6 text-center">
+          <div className="bg-white rounded-2xl shadow-sm border p-6 text-center">
             <p className="text-sm text-slate-700 font-semibold mb-1">
               Not authorized
             </p>
@@ -230,7 +268,7 @@ export default function AdminUsersPage() {
             </div>
             <div>
               <p className="text-sm font-semibold text-slate-900">
-                User Roles
+                User Management
               </p>
               <p className="text-xs text-slate-500">
                 Signed in as admin
@@ -249,11 +287,17 @@ export default function AdminUsersPage() {
         )}
 
         <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
-          <div className="flex items-center justify-between">
-            <p className="text-sm text-slate-700">
-              Assign roles to users. This controls what part of the purchasing
-              workflow they see.
-            </p>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="text-sm text-slate-700">
+              <p className="font-semibold mb-1">
+                Manage users for StokStack
+              </p>
+              <p className="text-xs text-slate-500">
+                Users sign up via the login page. Admins can then set their
+                role, name, and disable or re-enable access here.
+              </p>
+            </div>
+
             <button
               type="button"
               onClick={handleSave}
@@ -276,58 +320,101 @@ export default function AdminUsersPage() {
                   <th className="px-3 py-2">User (name / email)</th>
                   <th className="px-3 py-2">User ID</th>
                   <th className="px-3 py-2">Role</th>
+                  <th className="px-3 py-2 text-right">Status</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((row) => (
-                  <tr
-                    key={row.id}
-                    className="border-b last:border-0 hover:bg-slate-50"
-                  >
-                    <td className="px-3 py-2">
-                      <input
-                        type="text"
-                        value={row.display_name || ""}
-                        onChange={(e) =>
-                          handleNameChange(row.id, e.target.value)
-                        }
-                        className="w-full px-2 py-1 border rounded-lg text-xs"
-                        placeholder="Name or email"
-                      />
-                    </td>
-                    <td className="px-3 py-2">
-                      <p className="text-[11px] text-slate-500 break-all">
-                        {row.id}
-                      </p>
-                    </td>
-                    <td className="px-3 py-2">
-                      <select
-                        value={row.role}
-                        onChange={(e) =>
-                          handleRoleChange(row.id, e.target.value)
-                        }
-                        className="px-2 py-1 border rounded-lg text-xs"
-                      >
-                        {ROLE_OPTIONS.map((role) => (
-                          <option key={role} value={role}>
-                            {role}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                  </tr>
-                ))}
+                {rows.map((row) => {
+                  const inactive = !row.is_active;
+                  return (
+                    <tr
+                      key={row.id}
+                      className={`border-b last:border-0 ${
+                        inactive ? "bg-slate-50" : "hover:bg-slate-50"
+                      }`}
+                    >
+                      <td className="px-3 py-2 align-top">
+                        <input
+                          type="text"
+                          value={row.display_name || ""}
+                          onChange={(e) =>
+                            handleNameChange(row.id, e.target.value)
+                          }
+                          className={`w-full px-2 py-1 border rounded-lg text-xs ${
+                            inactive
+                              ? "bg-slate-100 text-slate-400"
+                              : "bg-white"
+                          }`}
+                          placeholder="Name or email"
+                        />
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        <p className="text-[11px] text-slate-500 break-all">
+                          {row.id}
+                        </p>
+                      </td>
+                      <td className="px-3 py-2 align-top">
+                        <select
+                          value={row.role}
+                          onChange={(e) =>
+                            handleRoleChange(row.id, e.target.value)
+                          }
+                          className={`px-2 py-1 border rounded-lg text-xs ${
+                            inactive
+                              ? "bg-slate-100 text-slate-400"
+                              : "bg-white"
+                          }`}
+                          disabled={inactive}
+                        >
+                          {ROLE_OPTIONS.map((role) => (
+                            <option key={role} value={role}>
+                              {role}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-3 py-2 align-top text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleActive(row)}
+                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] ${
+                            row.is_active
+                              ? "bg-red-50 text-red-700 hover:bg-red-100"
+                              : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                          }`}
+                        >
+                          {row.is_active ? (
+                            <>
+                              <Ban className="w-3 h-3" />
+                              Disable
+                            </>
+                          ) : (
+                            <>
+                              <RotateCcw className="w-3 h-3" />
+                              Re-enable
+                            </>
+                          )}
+                        </button>
+                        {!row.is_active && (
+                          <p className="mt-1 text-[10px] text-slate-400">
+                            Disabled users cannot access the app, but their
+                            history is preserved.
+                          </p>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
 
           <p className="text-[11px] text-slate-400">
-            Roles: <strong>requester</strong> (creates requests),{" "}
-            <strong>pm</strong> (project manager approval),{" "}
-            <strong>president</strong> (final approval),{" "}
-            <strong>purchaser</strong> (buys materials),{" "}
-            <strong>receiver</strong> (marks received),{" "}
-            <strong>admin</strong> (can manage roles).
+            🔑 <strong>Create users:</strong> they sign up on the login page
+            (email/password). A profile is created automatically on first
+            login. Then admin can assign roles and disable/enable here.  
+            ❌ <strong>Hard delete:</strong> deleting auth accounts requires
+            a secure backend service and should not be done from the browser.
           </p>
         </div>
       </main>
