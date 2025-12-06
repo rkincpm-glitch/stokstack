@@ -184,6 +184,32 @@ export default function AdminUsersPage() {
     setSaveStatus("saving");
     setErrorMsg(null);
 
+    // 🔍 1) Check for duplicate display_name (case-insensitive)
+    const seen = new Map<string, number>(); // name -> count
+    const dups = new Set<string>();
+
+    for (const row of rows) {
+      const name = row.display_name?.trim().toLowerCase();
+      if (!name) continue;
+      const count = (seen.get(name) || 0) + 1;
+      seen.set(name, count);
+      if (count > 1) {
+        dups.add(name);
+      }
+    }
+
+    if (dups.size > 0) {
+      const dupList = Array.from(dups)
+        .map((n) => `"${n}"`)
+        .join(", ");
+      setErrorMsg(
+        `Duplicate user names found (${dupList}). Please make each display name unique before saving.`
+      );
+      setSaveStatus("idle");
+      return;
+    }
+
+    // 2) Save to Supabase
     try {
       for (const row of rows) {
         await supabase
@@ -294,7 +320,8 @@ export default function AdminUsersPage() {
               </p>
               <p className="text-xs text-slate-500">
                 Users sign up via the login page. Admins can then set their
-                role, name, and disable or re-enable access here.
+                role, name, and disable or re-enable access here.  
+                Display names must be unique to avoid confusion.
               </p>
             </div>
 
@@ -412,9 +439,9 @@ export default function AdminUsersPage() {
           <p className="text-[11px] text-slate-400">
             🔑 <strong>Create users:</strong> they sign up on the login page
             (email/password). A profile is created automatically on first
-            login. Then admin can assign roles and disable/enable here.  
-            ❌ <strong>Hard delete:</strong> deleting auth accounts requires
-            a secure backend service and should not be done from the browser.
+            login. Admin then assigns roles here.  
+            ❌ <strong>Hard delete:</strong> removing auth accounts requires
+            a secure backend; use “Disable” instead.
           </p>
         </div>
       </main>
