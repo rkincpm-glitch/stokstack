@@ -197,7 +197,7 @@ export default function AdminUsersPage() {
           </div>
         </header>
         <main className="max-w-4xl mx-auto px-4 py-6">
-          <div className="bg-white rounded-2xl shadow-sm border p-6 text-center">
+          <div className="bg-white rounded-2xlshadow-sm border p-6 text-center">
             <p className="text-sm text-slate-700 font-semibold mb-1">
               Not authorized
             </p>
