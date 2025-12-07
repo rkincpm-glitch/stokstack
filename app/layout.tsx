@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "StokStack - Professional Inventory Management",
+  title: "StokStak - Professional Inventory Management",
   description: "Modern inventory & stock management system",
   manifest: "/manifest.json",
 };

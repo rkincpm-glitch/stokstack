@@ -46,7 +46,7 @@ export default function AuthPage() {
           <div className="w-16 h-16 bg-blue-600 rounded-xl flex items-center justify-center mb-4">
             <Package className="w-8 h-8 text-white" />
           </div>
-          <h1 className="text-2xl font-bold text-gray-900">StockStack</h1>
+          <h1 className="text-2xl font-bold text-gray-900">StokStak</h1>
           <p className="text-gray-600 mt-2">Inventory Management System</p>
         </div>
 
@@ -96,7 +96,7 @@ export default function AuthPage() {
 
           <div className="text-center text-xs text-gray-500 mt-6">
             <p>Demo Credentials:</p>
-            <p>Email: demo@stockstack.com</p>
+            <p>Email: demo@stokstak.com</p>
             <p>Password: demo123</p>
           </div>
         </div>
