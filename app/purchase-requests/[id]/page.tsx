@@ -49,15 +49,18 @@ type RequestItem = {
   unit: string | null;
   application_location: string | null;
   est_unit_price: number | null;
-  status: string; // pending, approved, rejected
+  status: string; // pending, approved, partially_approved, rejected
   reject_comment: string | null;
   resubmit_comment: string | null;
+  approved_qty: number | null; // NEW: partial/full approved quantity
 };
 
 type Profile = {
   id: string;
   role: string;
   display_name: string | null;
+  can_purchase?: boolean;
+  can_receive?: boolean;
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -69,15 +72,6 @@ const STATUS_LABEL: Record<string, string> = {
   received: "Received",
   rejected: "Rejected",
 };
-
-const STATUS_ORDER = [
-  "submitted",
-  "pm_approved",
-  "president_approved",
-  "purchased",
-  "delivered",
-  "received",
-];
 
 export default function PurchaseRequestDetailPage() {
   const router = useRouter();
@@ -113,41 +107,45 @@ export default function PurchaseRequestDetailPage() {
       const uid = userData.user.id;
       setUserId(uid);
 
-      // --- ensure profile exists + get role ---
-      let role = "requester";
-      let displayName: string | null = null;
-
-      const { data: profData, error: profError } = await supabase
+      // Load profile with new capability flags
+      const { data: profData } = await supabase
         .from("profiles")
-        .select("id, role, display_name")
+        .select("id, role, display_name, can_purchase, can_receive")
         .eq("id", uid)
         .maybeSingle();
 
-      if (!profError && profData) {
+      let role = "requester";
+      let displayName: string | null = null;
+      let can_purchase = false;
+      let can_receive = false;
+
+      if (profData) {
         role = profData.role || "requester";
         displayName = profData.display_name || null;
-      } else if (!profData && !profError) {
-        // auto-create default profile
-        await supabase.from("profiles").insert({
-          id: uid,
-          role: "requester",
-        });
+        can_purchase = !!profData.can_purchase;
+        can_receive = !!profData.can_receive;
       }
 
-      const myProfile: Profile = { id: uid, role, display_name: displayName };
-      setProfile(myProfile);
+      setProfile({
+        id: uid,
+        role,
+        display_name: displayName,
+        can_purchase,
+        can_receive,
+      });
 
       if (!invalidId) {
-        await loadRequest(uid, role);
+        await loadRequest();
       }
 
       setLoading(false);
     };
 
     init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId]);
 
-  const loadRequest = async (uid: string, role: string) => {
+  const loadRequest = async () => {
     setErrorMsg(null);
     setInfoMsg(null);
 
@@ -165,16 +163,6 @@ export default function PurchaseRequestDetailPage() {
       setErrorMsg(
         `Could not load purchase request: ${reqError?.message || "Not found"}`
       );
-      return;
-    }
-
-    // --- access control ---
-    // requester → only own requests
-    if (role === "requester" && reqData.requested_by !== uid) {
-      setRequest(null);
-      setProject(null);
-      setItems([]);
-      setErrorMsg("You are not allowed to view this purchase request.");
       return;
     }
 
@@ -203,32 +191,39 @@ export default function PurchaseRequestDetailPage() {
     }
   };
 
+  const isAdmin = profile?.role === "admin";
+
   // who can advance what?
   const canApproveReject =
     profile &&
     request &&
     ((profile.role === "pm" && request.status === "submitted") ||
-      (profile.role === "president" && request.status === "pm_approved"));
+      (profile.role === "president" && request.status === "pm_approved") ||
+      isAdmin);
+
+  const canPurchase =
+    profile &&
+    (profile.can_purchase ||
+      profile.role === "purchaser" ||
+      isAdmin);
 
   const canMarkPurchased =
-    profile &&
-    request &&
-    profile.role === "purchaser" &&
-    request.status === "president_approved";
+    request && canPurchase && request.status === "president_approved";
 
   const canMarkDelivered =
+    request && canPurchase && request.status === "purchased";
+
+  const canReceive =
     profile &&
-    request &&
-    profile.role === "purchaser" &&
-    request.status === "purchased";
+    (profile.can_receive || canPurchase || isAdmin);
 
   const canMarkReceived =
-    profile &&
     request &&
-    profile.role === "receiver" &&
+    canReceive &&
     (request.status === "purchased" || request.status === "delivered");
 
-  const canReceiveToStock = profile && request && request.status === "received";
+  const canReceiveToStock =
+    profile && request && request.status === "received";
 
   const logEvent = async (opts: {
     event_type: string;
@@ -251,7 +246,7 @@ export default function PurchaseRequestDetailPage() {
   };
 
   const updateRequestStatus = async (nextStatus: string, comment?: string) => {
-    if (!request || !userId || !profile) return;
+    if (!request || !userId) return;
 
     setSavingStatus(true);
     setErrorMsg(null);
@@ -297,9 +292,11 @@ export default function PurchaseRequestDetailPage() {
       comment: comment || null,
     });
 
-    await loadRequest(userId, profile.role);
+    await loadRequest();
     setSavingStatus(false);
-    setInfoMsg(`Status updated to ${STATUS_LABEL[nextStatus] || nextStatus}.`);
+    setInfoMsg(
+      `Status updated to ${STATUS_LABEL[nextStatus] || nextStatus}.`
+    );
   };
 
   const handleApproveOrReject = async (action: "approve" | "reject") => {
@@ -318,8 +315,14 @@ export default function PurchaseRequestDetailPage() {
         request.status === "pm_approved"
       ) {
         nextStatus = "president_approved";
+      } else if (isAdmin) {
+        // admin can jump to next logical status if needed
+        if (request.status === "submitted") nextStatus = "pm_approved";
+        else if (request.status === "pm_approved")
+          nextStatus = "president_approved";
       }
     } else {
+      // reject whole request
       const c = window.prompt("Enter rejection reason for this request:");
       if (!c || !c.trim()) {
         alert("Rejection reason is required.");
@@ -336,11 +339,64 @@ export default function PurchaseRequestDetailPage() {
     item: RequestItem,
     action: "approve" | "reject"
   ) => {
-    if (!profile || !userId) return;
+    if (!profile) return;
 
-    let comment: string | null = null;
+    const maxQty = Number(item.quantity || 0);
+    if (maxQty <= 0) {
+      setErrorMsg("Item has no valid quantity to approve/reject.");
+      return;
+    }
 
-    if (action === "reject") {
+    let newStatus = item.status;
+    let approved_qty = item.approved_qty ?? 0;
+    let reject_comment = item.reject_comment;
+    let resubmit_comment = item.resubmit_comment;
+    let commentForLog: string | null = null;
+
+    if (action === "approve") {
+      // partial or full approval
+      const defaultQty =
+        item.approved_qty && item.approved_qty > 0
+          ? item.approved_qty
+          : maxQty;
+
+      const input = window.prompt(
+        `Enter quantity to APPROVE for this line (max ${maxQty}):`,
+        String(defaultQty)
+      );
+
+      if (input === null) {
+        // user cancelled
+        return;
+      }
+
+      const qty = Number(input);
+      if (!Number.isFinite(qty) || qty <= 0 || qty > maxQty) {
+        alert(`Please enter a number between 1 and ${maxQty}.`);
+        return;
+      }
+
+      approved_qty = qty;
+
+      if (qty === maxQty) {
+        newStatus = "approved";
+      } else {
+        newStatus = "partially_approved";
+      }
+
+      if (item.status === "rejected") {
+        const c = window.prompt(
+          "This line was previously rejected. Enter a note for re-approval:"
+        );
+        if (!c || !c.trim()) {
+          alert("A note is required to re-approve a rejected item.");
+          return;
+        }
+        resubmit_comment = c.trim();
+        commentForLog = resubmit_comment;
+      }
+    } else {
+      // full reject with comment
       const c = window.prompt(
         "Enter rejection comment for this line item (required):"
       );
@@ -348,29 +404,19 @@ export default function PurchaseRequestDetailPage() {
         alert("Rejection comment is required.");
         return;
       }
-      comment = c.trim();
-    } else if (item.status === "rejected") {
-      const c = window.prompt(
-        "This item was previously rejected. Enter special comment to approve it now:"
-      );
-      if (!c || !c.trim()) {
-        alert("Comment is required to re-approve a rejected item.");
-        return;
-      }
-      comment = c.trim();
+      reject_comment = c.trim();
+      approved_qty = 0;
+      newStatus = "rejected";
+      commentForLog = reject_comment;
     }
-
-    const newStatus = action === "approve" ? "approved" : "rejected";
 
     const { error } = await supabase
       .from("purchase_request_items")
       .update({
         status: newStatus,
-        reject_comment: action === "reject" ? comment : item.reject_comment,
-        resubmit_comment:
-          action === "approve" && item.status === "rejected"
-            ? comment
-            : item.resubmit_comment,
+        approved_qty,
+        reject_comment,
+        resubmit_comment,
       })
       .eq("id", item.id);
 
@@ -381,49 +427,54 @@ export default function PurchaseRequestDetailPage() {
     }
 
     await logEvent({
-      event_type: action === "approve" ? "item_approved" : "item_rejected",
+      event_type:
+        action === "approve" ? "item_approved" : "item_rejected",
       item_id: item.id,
-      comment: comment,
+      comment: commentForLog,
     });
 
-    await loadRequest(userId, profile.role);
+    await loadRequest();
   };
 
   const handleReceiveToStock = async () => {
-    if (!request || !userId || !profile) return;
+    if (!request || !userId) return;
 
     setStocking(true);
     setErrorMsg(null);
     setInfoMsg(null);
 
     try {
-      const freshItems = items;
+      const freshItems = items; // current state
 
       for (const it of freshItems) {
-        if (it.status === "rejected") continue;
+        if (it.status === "rejected") {
+          continue; // don't stock rejected lines
+        }
+
+        const qtyToUse =
+          (it.approved_qty != null ? it.approved_qty : it.quantity) || 0;
+
+        if (qtyToUse <= 0) {
+          continue;
+        }
 
         if (it.item_id) {
+          // existing inventory item → update quantity (MVP: override or you can adjust to increment)
           await supabase
             .from("items")
             .update({
-              quantity: it.quantity || 0,
+              quantity: qtyToUse,
             })
-            .eq("id", it.item_id)
-            .select()
-            .single()
-            .then(({ error }) => {
-              if (error) {
-                console.error("Error updating stock item:", error);
-              }
-            });
+            .eq("id", it.item_id);
         } else {
+          // new inventory item
           const { data: newItem, error: newErr } = await supabase
             .from("items")
             .insert({
               user_id: userId,
               name: it.description,
               description: request.notes,
-              quantity: it.quantity,
+              quantity: qtyToUse,
               location: it.application_location,
               category: null,
               te_number: null,
@@ -436,6 +487,7 @@ export default function PurchaseRequestDetailPage() {
           if (newErr) {
             console.error("Error creating inventory item:", newErr);
           } else if (newItem) {
+            // back-link line item → inventory item
             await supabase
               .from("purchase_request_items")
               .update({ item_id: newItem.id })
@@ -483,9 +535,15 @@ export default function PurchaseRequestDetailPage() {
     );
   }
 
-  const totalEst = items.reduce((sum, it) => {
+  const totalEstRequested = items.reduce((sum, it) => {
     const price = it.est_unit_price || 0;
     return sum + price * Number(it.quantity || 0);
+  }, 0);
+
+  const totalEstApproved = items.reduce((sum, it) => {
+    const price = it.est_unit_price || 0;
+    const qty = it.approved_qty != null ? it.approved_qty : 0;
+    return sum + price * qty;
   }, 0);
 
   const currentStatusLabel = STATUS_LABEL[request.status] || request.status;
@@ -513,7 +571,9 @@ export default function PurchaseRequestDetailPage() {
               </p>
               <p className="text-xs text-slate-500">
                 Status: {currentStatusLabel}
-                {profile ? ` · Role: ${profile.role}` : ""}
+                {profile ? ` · Role: ${profile.role}` : ""}{" "}
+                {profile?.can_receive ? "· Receiver" : ""}
+                {profile?.can_purchase ? "· Purchaser" : ""}
               </p>
             </div>
           </div>
@@ -579,10 +639,11 @@ export default function PurchaseRequestDetailPage() {
             </div>
           )}
 
-          {/* Approver actions */}
+          {/* Approver / purchaser / receiver actions */}
           <div className="pt-3 border-t flex flex-wrap items-center gap-3 justify-between">
             <p className="text-xs text-slate-500">
-              Use the actions below to move this request through the workflow.
+              Use the actions below to move this request through the workflow,
+              including partial approvals per item.
             </p>
 
             <div className="flex flex-wrap gap-2">
@@ -657,13 +718,19 @@ export default function PurchaseRequestDetailPage() {
 
         {/* Line items */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between flex-wrap gap-2">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
               Line Items
             </h2>
-            <div className="text-xs text-slate-500 flex items-center gap-2">
-              <DollarSign className="w-3 h-3" />
-              Est. total: ${totalEst.toFixed(2)}
+            <div className="text-xs text-slate-500 flex flex-col items-end">
+              <span className="inline-flex items-center gap-2">
+                <DollarSign className="w-3 h-3" />
+                Requested total: ${totalEstRequested.toFixed(2)}
+              </span>
+              <span className="inline-flex items-center gap-2">
+                <DollarSign className="w-3 h-3" />
+                Approved total: ${totalEstApproved.toFixed(2)}
+              </span>
             </div>
           </div>
 
@@ -683,13 +750,19 @@ export default function PurchaseRequestDetailPage() {
                       Location
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
-                      Qty
+                      Requested
+                    </th>
+                    <th className="text-right px-3 py-2 font-medium">
+                      Approved
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
                       Est. Unit
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
-                      Est. Total
+                      Est. Total (Req)
+                    </th>
+                    <th className="text-right px-3 py-2 font-medium">
+                      Est. Total (Appr)
                     </th>
                     <th className="text-left px-3 py-2 font-medium">
                       Status
@@ -703,17 +776,24 @@ export default function PurchaseRequestDetailPage() {
                   {items.map((it) => {
                     const unit = it.unit || "ea";
                     const unitPrice = it.est_unit_price || 0;
-                    const lineTotal = unitPrice * Number(it.quantity || 0);
+                    const reqQty = Number(it.quantity || 0);
+                    const apprQty =
+                      it.approved_qty != null ? Number(it.approved_qty) : 0;
+
+                    const reqTotal = unitPrice * reqQty;
+                    const apprTotal = unitPrice * apprQty;
 
                     const statusBadge =
                       it.status === "approved"
                         ? "bg-emerald-100 text-emerald-700"
+                        : it.status === "partially_approved"
+                        ? "bg-blue-100 text-blue-700"
                         : it.status === "rejected"
                         ? "bg-red-100 text-red-700"
                         : "bg-slate-100 text-slate-700";
 
                     const canActOnItem =
-                      canApproveReject || profile?.role === "admin";
+                      canApproveReject || isAdmin;
 
                     return (
                       <tr key={it.id} className="border-b last:border-0">
@@ -746,13 +826,19 @@ export default function PurchaseRequestDetailPage() {
                           </div>
                         </td>
                         <td className="px-3 py-2 align-top text-right">
-                          {Number(it.quantity)} {unit}
+                          {reqQty} {unit}
+                        </td>
+                        <td className="px-3 py-2 align-top text-right">
+                          {apprQty > 0 ? `${apprQty} ${unit}` : "-"}
                         </td>
                         <td className="px-3 py-2 align-top text-right">
                           {unitPrice ? `$${unitPrice.toFixed(2)}` : "-"}
                         </td>
+                        <td className="px-3 py-2 align-top text-right">
+                          {reqTotal ? `$${reqTotal.toFixed(2)}` : "-"}
+                        </td>
                         <td className="px-3 py-2 align-top text-right font-semibold text-slate-900">
-                          {lineTotal ? `$${lineTotal.toFixed(2)}` : "-"}
+                          {apprTotal ? `$${apprTotal.toFixed(2)}` : "-"}
                         </td>
                         <td className="px-3 py-2 align-top">
                           <span
@@ -771,7 +857,7 @@ export default function PurchaseRequestDetailPage() {
                                 }
                                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                               >
-                                Approve
+                                Approve (qty)
                               </button>
                               <button
                                 type="button"
@@ -793,13 +879,14 @@ export default function PurchaseRequestDetailPage() {
             </div>
           )}
 
-          {items.length > 0 && !items.some((i) => i.est_unit_price) && (
-            <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-center gap-2">
-              <AlertCircle className="w-3 h-3" />
-              No estimated prices entered; total is 0. Approvers may still use
-              this for scope/quantity only.
-            </div>
-          )}
+          {items.length > 0 &&
+            !items.some((i) => i.est_unit_price) && (
+              <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-center gap-2">
+                <AlertCircle className="w-3 h-3" />
+                No estimated prices entered; totals are 0. You can still use
+                this for quantity-only approvals.
+              </div>
+            )}
         </section>
       </main>
     </div>

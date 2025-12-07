@@ -17,6 +17,8 @@ type ProfileRow = {
   display_name: string | null;
   role: string;
   is_active: boolean;
+  can_purchase: boolean;
+  can_receive: boolean;
 };
 
 const ROLE_OPTIONS = [
@@ -24,7 +26,6 @@ const ROLE_OPTIONS = [
   "pm",
   "president",
   "purchaser",
-  "receiver",
   "admin",
 ];
 
@@ -61,7 +62,7 @@ export default function AdminUsersPage() {
     // 1) Ensure current user has a profile
     let { data: prof, error: profError } = await supabase
       .from("profiles")
-      .select("id, role, display_name, is_active")
+      .select("id, role, display_name, is_active, can_purchase, can_receive")
       .eq("id", userId)
       .maybeSingle();
 
@@ -74,8 +75,10 @@ export default function AdminUsersPage() {
           role: "requester",
           display_name: email,
           is_active: true,
+          can_purchase: false,
+          can_receive: false,
         })
-        .select("id, role, display_name, is_active")
+        .select("id, role, display_name, is_active, can_purchase, can_receive")
         .single();
       prof = newProf;
     }
@@ -89,7 +92,7 @@ export default function AdminUsersPage() {
     // 2) Load all profiles
     const { data: allProfiles, error: allError } = await supabase
       .from("profiles")
-      .select("id, role, display_name, is_active, created_at")
+      .select("id, role, display_name, is_active, can_purchase, can_receive, created_at")
       .order("created_at", { ascending: true });
 
     if (allError) {
@@ -122,6 +125,8 @@ export default function AdminUsersPage() {
       role: prof.role || "requester",
       display_name: prof.display_name || email,
       is_active: prof.is_active ?? true,
+      can_purchase: !!prof.can_purchase,
+      can_receive: !!prof.can_receive,
     };
     setAuthProfile(currentProfile);
 
@@ -136,6 +141,8 @@ export default function AdminUsersPage() {
       role: p.role,
       display_name: p.display_name || p.id,
       is_active: p.is_active ?? true,
+      can_purchase: !!p.can_purchase,
+      can_receive: !!p.can_receive,
     }));
 
     setRows(rowsNormalized);
@@ -151,6 +158,14 @@ export default function AdminUsersPage() {
   const handleNameChange = (id: string, name: string) => {
     setRows((prev) =>
       prev.map((r) => (r.id === id ? { ...r, display_name: name } : r))
+    );
+  };
+
+  const handleCapabilityChange = (id: string, field: "can_purchase" | "can_receive", value: boolean) => {
+    setRows((prev) =>
+      prev.map((r) =>
+        r.id === id ? { ...r, [field]: value } : r
+      )
     );
   };
 
@@ -226,6 +241,8 @@ export default function AdminUsersPage() {
             role: row.role,
             display_name: row.display_name,
             is_active: row.is_active,
+            can_purchase: !!row.can_purchase,
+            can_receive: !!row.can_receive,
           })
           .eq("id", row.id);
       }
@@ -324,12 +341,12 @@ export default function AdminUsersPage() {
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="text-sm text-slate-700">
               <p className="font-semibold mb-1">
-                Manage users for stokstak
+                Manage users for StokStak
               </p>
               <p className="text-xs text-slate-500">
                 Users sign up via the login page. Admins can then set their
-                role, name, and disable or re-enable access here.  
-                Display names must be unique to avoid confusion.
+                role, name, and toggle extra capabilities like purchasing or
+                receiving here. Display names must be unique to avoid confusion.
               </p>
             </div>
 
@@ -355,6 +372,7 @@ export default function AdminUsersPage() {
                   <th className="px-3 py-2">User (name / email)</th>
                   <th className="px-3 py-2">User ID</th>
                   <th className="px-3 py-2">Role</th>
+                  <th className="px-3 py-2">Capabilities</th>
                   <th className="px-3 py-2 text-right">Status</th>
                 </tr>
               </thead>
@@ -410,6 +428,40 @@ export default function AdminUsersPage() {
                           ))}
                         </select>
                       </td>
+                      <td className="px-3 py-2 align-top">
+                        <div className="flex flex-col gap-1 text-[11px]">
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={row.can_purchase}
+                              disabled={inactive}
+                              onChange={(e) =>
+                                handleCapabilityChange(
+                                  row.id,
+                                  "can_purchase",
+                                  e.target.checked
+                                )
+                              }
+                            />
+                            <span>Can purchase</span>
+                          </label>
+                          <label className="inline-flex items-center gap-1">
+                            <input
+                              type="checkbox"
+                              checked={row.can_receive}
+                              disabled={inactive}
+                              onChange={(e) =>
+                                handleCapabilityChange(
+                                  row.id,
+                                  "can_receive",
+                                  e.target.checked
+                                )
+                              }
+                            />
+                            <span>Can receive</span>
+                          </label>
+                        </div>
+                      </td>
                       <td className="px-3 py-2 align-top text-right">
                         <button
                           type="button"
@@ -450,7 +502,7 @@ export default function AdminUsersPage() {
           <p className="text-[11px] text-slate-400">
             🔑 <strong>Create users:</strong> they sign up on the login page
             (email/password). A profile is created automatically on first
-            login. Admin then assigns roles here.  
+            login. Admin then assigns roles and capabilities here.  
             ❌ <strong>Hard delete:</strong> removing auth accounts requires
             a secure backend; use “Disable” instead.
           </p>
