@@ -329,7 +329,7 @@ export default function Dashboard() {
                 <Package className="w-6 h-6 text-white" />
               </div>
               <div>
-                <h1 className="text-xl font-bold text-slate-900">StokStack</h1>
+                <h1 className="text-xl font-bold text-slate-900">stokstak</h1>
                 <p className="text-xs text-slate-500">
                   Inventory & Purchasing
                 </p>

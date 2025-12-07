@@ -324,7 +324,7 @@ export default function AdminUsersPage() {
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="text-sm text-slate-700">
               <p className="font-semibold mb-1">
-                Manage users for StokStack
+                Manage users for stokstak
               </p>
               <p className="text-xs text-slate-500">
                 Users sign up via the login page. Admins can then set their

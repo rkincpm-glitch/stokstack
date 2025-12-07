@@ -348,7 +348,7 @@ export default function AddItemPage() {
               <p className="text-sm font-semibold text-slate-900">
                 New Item
               </p>
-              <p className="text-xs text-slate-500">Add to StokStack</p>
+              <p className="text-xs text-slate-500">Add to stokstak</p>
             </div>
           </div>
         </div>
