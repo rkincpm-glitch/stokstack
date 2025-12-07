@@ -12,7 +12,6 @@ import {
   DollarSign,
   CheckCircle2,
   AlertCircle,
-  Package,
   Boxes,
 } from "lucide-react";
 
@@ -36,7 +35,6 @@ type PurchaseRequest = {
   president_approved_at: string | null;
   purchased_by: string | null;
   purchased_at: string | null;
-  // no more delivered step
   received_by: string | null;
   received_at: string | null;
   // optional PR number like PUR-00101
@@ -55,6 +53,11 @@ type RequestItem = {
   status: string; // pending, approved, rejected
   reject_comment: string | null;
   resubmit_comment: string | null;
+
+  // NEW: partial purchase / receive + receive photo
+  purchased_qty: number | null;
+  received_qty: number | null;
+  receive_photo_url: string | null;
 };
 
 type Profile = {
@@ -90,6 +93,8 @@ export default function PurchaseRequestDetailPage() {
   const [request, setRequest] = useState<PurchaseRequest | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [items, setItems] = useState<RequestItem[]>([]);
+
+  const [uploadingItemId, setUploadingItemId] = useState<string | null>(null);
 
   // UUID guard
   const uuidRegex =
@@ -131,6 +136,7 @@ export default function PurchaseRequestDetailPage() {
     };
 
     init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId]);
 
   const loadRequest = async () => {
@@ -254,7 +260,7 @@ export default function PurchaseRequestDetailPage() {
       payload.received_by = userId;
       payload.received_at = now;
     } else if (nextStatus === "stocked") {
-      // mark as stocked, no extra fields
+      // nothing special
     }
 
     const from = request.status;
@@ -379,6 +385,142 @@ export default function PurchaseRequestDetailPage() {
     await loadRequest();
   };
 
+  const handleSetPurchasedQty = async (item: RequestItem) => {
+    if (!profile || isLocked) return;
+    if (!(profile.role === "purchaser" || isAdmin)) return;
+
+    const defaultVal =
+      item.purchased_qty ?? item.quantity ?? 0;
+    const input = window.prompt(
+      "Enter purchased quantity for this line:",
+      String(defaultVal)
+    );
+    if (input === null) return;
+    const val = Number(input);
+    if (!Number.isFinite(val) || val < 0) {
+      alert("Invalid quantity.");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("purchase_request_items")
+      .update({ purchased_qty: val })
+      .eq("id", item.id);
+
+    if (error) {
+      console.error("Error updating purchased qty:", error);
+      setErrorMsg(`Error updating purchased quantity: ${error.message}`);
+      return;
+    }
+
+    await logEvent({
+      event_type: "item_purchased_qty",
+      item_id: item.id,
+      comment: `Purchased qty set to ${val}`,
+    });
+
+    await loadRequest();
+  };
+
+  const handleSetReceivedQty = async (item: RequestItem) => {
+    if (!profile || isLocked) return;
+    if (
+      !(
+        profile.role === "receiver" ||
+        profile.role === "purchaser" ||
+        isAdmin
+      )
+    )
+      return;
+
+    const defaultVal =
+      item.received_qty ??
+      item.purchased_qty ??
+      item.quantity ??
+      0;
+    const input = window.prompt(
+      "Enter received quantity for this line:",
+      String(defaultVal)
+    );
+    if (input === null) return;
+    const val = Number(input);
+    if (!Number.isFinite(val) || val < 0) {
+      alert("Invalid quantity.");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("purchase_request_items")
+      .update({ received_qty: val })
+      .eq("id", item.id);
+
+    if (error) {
+      console.error("Error updating received qty:", error);
+      setErrorMsg(`Error updating received quantity: ${error.message}`);
+      return;
+    }
+
+    await logEvent({
+      event_type: "item_received_qty",
+      item_id: item.id,
+      comment: `Received qty set to ${val}`,
+    });
+
+    await loadRequest();
+  };
+
+  const handleUploadReceivePhoto = async (
+    item: RequestItem,
+    file: File | null
+  ) => {
+    if (!file || !userId || isLocked) return;
+
+    try {
+      setUploadingItemId(item.id);
+      setErrorMsg(null);
+
+      const ext = file.name.split(".").pop() || "jpg";
+      const path = `receive-photos/${item.id}-${Date.now()}.${ext}`;
+
+      // Make sure the bucket name matches your Supabase storage bucket
+      const { data, error } = await supabase.storage
+        .from("item-images")
+        .upload(path, file);
+
+      if (error) {
+        console.error("Upload error:", error);
+        setErrorMsg("Error uploading photo.");
+        setUploadingItemId(null);
+        return;
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from("item-images")
+        .getPublicUrl(data.path);
+
+      const publicUrl = publicUrlData.publicUrl;
+
+      const { error: updErr } = await supabase
+        .from("purchase_request_items")
+        .update({ receive_photo_url: publicUrl })
+        .eq("id", item.id);
+
+      if (updErr) {
+        console.error("Error saving photo url:", updErr);
+        setErrorMsg("Error saving photo URL.");
+      } else {
+        await logEvent({
+          event_type: "item_receive_photo",
+          item_id: item.id,
+          comment: "Receive photo uploaded.",
+        });
+        await loadRequest();
+      }
+    } finally {
+      setUploadingItemId(null);
+    }
+  };
+
   const handleReceiveToStock = async () => {
     if (!request || !userId || isLocked) return;
 
@@ -387,22 +529,49 @@ export default function PurchaseRequestDetailPage() {
     setInfoMsg(null);
 
     try {
-      const freshItems = items; // current state
+      const freshItems = items;
 
       for (const it of freshItems) {
         if (it.status === "rejected") {
           continue; // don't stock rejected lines
         }
 
+        // qty to send to stock = received_qty if set, else full quantity
+        const qtyToStock =
+          (it.received_qty ?? it.quantity ?? 0) as number;
+
+        if (qtyToStock <= 0) {
+          continue;
+        }
+
         if (it.item_id) {
-          // existing inventory item → increment quantity
-          await supabase
+          // existing inventory item → increment quantity, optionally add photo
+          const { data: existing, error: exErr } = await supabase
             .from("items")
-            .update({
-              // NOTE: this currently sets quantity, not increment — adjust as needed
-              quantity: it.quantity || 0,
-            })
+            .select("id, quantity, image_url, image_url_2")
+            .eq("id", it.item_id)
+            .single();
+
+          if (exErr || !existing) {
+            console.error("Error loading stock item:", exErr);
+            continue;
+          }
+
+          const newQty = (existing.quantity || 0) + qtyToStock;
+
+          const updatePayload: any = { quantity: newQty };
+          if (it.receive_photo_url) {
+            updatePayload.image_url_2 = it.receive_photo_url;
+          }
+
+          const { error: updErr } = await supabase
+            .from("items")
+            .update(updatePayload)
             .eq("id", it.item_id);
+
+          if (updErr) {
+            console.error("Error updating stock item:", updErr);
+          }
         } else {
           // new inventory item
           const { data: newItem, error: newErr } = await supabase
@@ -411,12 +580,13 @@ export default function PurchaseRequestDetailPage() {
               user_id: userId,
               name: it.description,
               description: request.notes,
-              quantity: it.quantity,
+              quantity: qtyToStock,
               location: it.application_location,
               category: null,
               te_number: null,
               purchase_price: it.est_unit_price,
               purchase_date: new Date().toISOString().slice(0, 10),
+              image_url: it.receive_photo_url || null,
             })
             .select()
             .single();
@@ -424,7 +594,6 @@ export default function PurchaseRequestDetailPage() {
           if (newErr) {
             console.error("Error creating inventory item:", newErr);
           } else if (newItem) {
-            // back-link line item → inventory item
             await supabase
               .from("purchase_request_items")
               .update({ item_id: newItem.id })
@@ -435,12 +604,15 @@ export default function PurchaseRequestDetailPage() {
 
       await logEvent({
         event_type: "stocked",
-        comment: "Items received into StokStak inventory.",
+        comment:
+          "Items received into StokStak inventory (partial quantities respected).",
       });
 
       // lock the request for everyone except admin by moving to "stocked"
       await updateRequestStatus("stocked");
-      setInfoMsg("Items added/updated in StokStak inventory and request locked.");
+      setInfoMsg(
+        "Items added/updated in StokStak inventory and request locked."
+      );
     } catch (err: any) {
       console.error(err);
       setErrorMsg("Error receiving into stock. See console for details.");
@@ -484,8 +656,7 @@ export default function PurchaseRequestDetailPage() {
     request.request_number ||
     `PUR-${request.id.slice(0, 8).toUpperCase()}`;
 
-  const canActOnItem =
-    !!canApproveReject && !isLocked; // admin is already included via canApproveReject
+  const canActOnItem = !!canApproveReject && !isLocked;
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -681,6 +852,12 @@ export default function PurchaseRequestDetailPage() {
                       Qty
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
+                      Purchased
+                    </th>
+                    <th className="text-right px-3 py-2 font-medium">
+                      Received
+                    </th>
+                    <th className="text-right px-3 py-2 font-medium">
                       Est. Unit
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
@@ -688,6 +865,9 @@ export default function PurchaseRequestDetailPage() {
                     </th>
                     <th className="text-left px-3 py-2 font-medium">
                       Status
+                    </th>
+                    <th className="text-left px-3 py-2 font-medium">
+                      Receive Photo
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
                       Actions
@@ -707,6 +887,24 @@ export default function PurchaseRequestDetailPage() {
                         : it.status === "rejected"
                         ? "bg-red-100 text-red-700"
                         : "bg-slate-100 text-slate-700";
+
+                    const purchasedQtyDisplay =
+                      it.purchased_qty != null
+                        ? it.purchased_qty
+                        : "";
+                    const receivedQtyDisplay =
+                      it.received_qty != null
+                        ? it.received_qty
+                        : "";
+
+                    const showPurchaseControls =
+                      !isLocked &&
+                      (profile?.role === "purchaser" || isAdmin);
+                    const showReceiveControls =
+                      !isLocked &&
+                      (profile?.role === "receiver" ||
+                        profile?.role === "purchaser" ||
+                        isAdmin);
 
                     return (
                       <tr key={it.id} className="border-b last:border-0">
@@ -732,21 +930,38 @@ export default function PurchaseRequestDetailPage() {
                             )}
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <div className="flex items-center gap-1 text-slate-600">
                             <MapPin className="w-3 h-3" />
                             <span>{it.application_location || "-"}</span>
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top text-right">
                           {Number(it.quantity)} {unit}
                         </td>
+
+                        <td className="px-3 py-2 align-top text-right">
+                          {purchasedQtyDisplay !== ""
+                            ? purchasedQtyDisplay
+                            : "-"}
+                        </td>
+
+                        <td className="px-3 py-2 align-top text-right">
+                          {receivedQtyDisplay !== ""
+                            ? receivedQtyDisplay
+                            : "-"}
+                        </td>
+
                         <td className="px-3 py-2 align-top text-right">
                           {unitPrice ? `$${unitPrice.toFixed(2)}` : "-"}
                         </td>
+
                         <td className="px-3 py-2 align-top text-right font-semibold text-slate-900">
                           {lineTotal ? `$${lineTotal.toFixed(2)}` : "-"}
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <span
                             className={`inline-flex px-2 py-0.5 rounded-full ${statusBadge}`}
@@ -754,29 +969,92 @@ export default function PurchaseRequestDetailPage() {
                             {it.status}
                           </span>
                         </td>
+
+                        <td className="px-3 py-2 align-top">
+                          <div className="flex flex-col gap-1">
+                            {it.receive_photo_url && (
+                              <a
+                                href={it.receive_photo_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-block"
+                              >
+                                <img
+                                  src={it.receive_photo_url}
+                                  alt="Receive"
+                                  className="w-14 h-14 object-cover rounded border"
+                                />
+                              </a>
+                            )}
+                            {showReceiveControls && (
+                              <div className="text-[10px] text-slate-600">
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  disabled={uploadingItemId === it.id}
+                                  onChange={(e) =>
+                                    handleUploadReceivePhoto(
+                                      it,
+                                      e.target.files?.[0] || null
+                                    )
+                                  }
+                                  className="block w-full text-[10px]"
+                                />
+                                {uploadingItemId === it.id && (
+                                  <span className="text-[10px] text-slate-500">
+                                    Uploading...
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        </td>
+
                         <td className="px-3 py-2 align-top text-right">
-                          {canActOnItem && (
-                            <div className="flex flex-col gap-1 items-end">
+                          <div className="flex flex-col gap-1 items-end">
+                            {canActOnItem && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleItemDecision(it, "approve")
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                >
+                                  Approve
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleItemDecision(it, "reject")
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-red-50 text-red-700 hover:bg-red-100"
+                                >
+                                  Reject
+                                </button>
+                              </>
+                            )}
+
+                            {showPurchaseControls && (
                               <button
                                 type="button"
-                                onClick={() =>
-                                  handleItemDecision(it, "approve")
-                                }
-                                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                                onClick={() => handleSetPurchasedQty(it)}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-sky-50 text-sky-700 hover:bg-sky-100"
                               >
-                                Approve
+                                Set purchased qty
                               </button>
+                            )}
+
+                            {showReceiveControls && (
                               <button
                                 type="button"
-                                onClick={() =>
-                                  handleItemDecision(it, "reject")
-                                }
-                                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-red-50 text-red-700 hover:bg-red-100"
+                                onClick={() => handleSetReceivedQty(it)}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-lime-50 text-lime-700 hover:bg-lime-100"
                               >
-                                Reject
+                                Set received qty
                               </button>
-                            </div>
-                          )}
+                            )}
+                          </div>
                         </td>
                       </tr>
                     );
