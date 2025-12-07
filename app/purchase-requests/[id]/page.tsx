@@ -49,18 +49,25 @@ type RequestItem = {
   unit: string | null;
   application_location: string | null;
   est_unit_price: number | null;
-  status: string; // pending, approved, partially_approved, rejected
+  status: string; // pending, approved, rejected
   reject_comment: string | null;
   resubmit_comment: string | null;
-  approved_qty: number | null; // NEW: partial/full approved quantity
+
+  // NEW: partial & receiving tracking
+  approved_qty: number | null;
+  purchased_qty: number | null;
+  delivered_qty: number | null;
+  received_qty: number | null;
+  received_image_url_1: string | null;
+  received_image_url_2: string | null;
 };
 
 type Profile = {
   id: string;
   role: string;
   display_name: string | null;
-  can_purchase?: boolean;
-  can_receive?: boolean;
+  can_purchase: boolean;
+  can_receive: boolean;
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -71,6 +78,22 @@ const STATUS_LABEL: Record<string, string> = {
   delivered: "Delivered",
   received: "Received",
   rejected: "Rejected",
+};
+
+const STATUS_ORDER = [
+  "submitted",
+  "pm_approved",
+  "president_approved",
+  "purchased",
+  "delivered",
+  "received",
+];
+
+type ItemEditState = {
+  approved_qty?: number | null;
+  purchased_qty?: number | null;
+  delivered_qty?: number | null;
+  received_qty?: number | null;
 };
 
 export default function PurchaseRequestDetailPage() {
@@ -90,6 +113,7 @@ export default function PurchaseRequestDetailPage() {
   const [request, setRequest] = useState<PurchaseRequest | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [items, setItems] = useState<RequestItem[]>([]);
+  const [itemEdits, setItemEdits] = useState<Record<string, ItemEditState>>({});
 
   // UUID guard
   const uuidRegex =
@@ -107,7 +131,7 @@ export default function PurchaseRequestDetailPage() {
       const uid = userData.user.id;
       setUserId(uid);
 
-      // Load profile with new capability flags
+      // Profile with capabilities
       const { data: profData } = await supabase
         .from("profiles")
         .select("id, role, display_name, can_purchase, can_receive")
@@ -142,7 +166,6 @@ export default function PurchaseRequestDetailPage() {
     };
 
     init();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId]);
 
   const loadRequest = async () => {
@@ -187,43 +210,55 @@ export default function PurchaseRequestDetailPage() {
       .order("created_at", { ascending: true });
 
     if (!itemsError && itemsData) {
-      setItems(itemsData as RequestItem[]);
+      const list = itemsData as RequestItem[];
+      setItems(list);
+
+      const initEdits: Record<string, ItemEditState> = {};
+      list.forEach((it) => {
+        initEdits[it.id] = {
+          approved_qty:
+            it.approved_qty ?? (it.status === "approved" ? it.quantity : null),
+          purchased_qty: it.purchased_qty ?? null,
+          delivered_qty: it.delivered_qty ?? null,
+          received_qty: it.received_qty ?? null,
+        };
+      });
+      setItemEdits(initEdits);
     }
   };
 
-  const isAdmin = profile?.role === "admin";
+  // who can do what?
 
-  // who can advance what?
   const canApproveReject =
     profile &&
     request &&
     ((profile.role === "pm" && request.status === "submitted") ||
       (profile.role === "president" && request.status === "pm_approved") ||
-      isAdmin);
-
-  const canPurchase =
-    profile &&
-    (profile.can_purchase ||
-      profile.role === "purchaser" ||
-      isAdmin);
+      profile.role === "admin");
 
   const canMarkPurchased =
-    request && canPurchase && request.status === "president_approved";
+    profile &&
+    request &&
+    (profile.can_purchase || profile.role === "admin") &&
+    request.status === "president_approved";
 
   const canMarkDelivered =
-    request && canPurchase && request.status === "purchased";
-
-  const canReceive =
     profile &&
-    (profile.can_receive || canPurchase || isAdmin);
+    request &&
+    (profile.can_purchase || profile.role === "admin") &&
+    request.status === "purchased";
 
   const canMarkReceived =
+    profile &&
     request &&
-    canReceive &&
+    (profile.can_receive || profile.role === "admin") &&
     (request.status === "purchased" || request.status === "delivered");
 
   const canReceiveToStock =
-    profile && request && request.status === "received";
+    profile &&
+    request &&
+    (profile.can_receive || profile.role === "admin") &&
+    request.status === "received";
 
   const logEvent = async (opts: {
     event_type: string;
@@ -294,9 +329,7 @@ export default function PurchaseRequestDetailPage() {
 
     await loadRequest();
     setSavingStatus(false);
-    setInfoMsg(
-      `Status updated to ${STATUS_LABEL[nextStatus] || nextStatus}.`
-    );
+    setInfoMsg(`Status updated to ${STATUS_LABEL[nextStatus] || nextStatus}.`);
   };
 
   const handleApproveOrReject = async (action: "approve" | "reject") => {
@@ -315,11 +348,6 @@ export default function PurchaseRequestDetailPage() {
         request.status === "pm_approved"
       ) {
         nextStatus = "president_approved";
-      } else if (isAdmin) {
-        // admin can jump to next logical status if needed
-        if (request.status === "submitted") nextStatus = "pm_approved";
-        else if (request.status === "pm_approved")
-          nextStatus = "president_approved";
       }
     } else {
       // reject whole request
@@ -341,62 +369,55 @@ export default function PurchaseRequestDetailPage() {
   ) => {
     if (!profile) return;
 
-    const maxQty = Number(item.quantity || 0);
-    if (maxQty <= 0) {
-      setErrorMsg("Item has no valid quantity to approve/reject.");
+    let comment: string | null = null;
+
+    // partial approved qty prompt when approving
+    if (action === "approve") {
+      const currentApproved =
+        itemEdits[item.id]?.approved_qty ?? item.approved_qty ?? item.quantity;
+      const qtyStr = window.prompt(
+        `Enter approved quantity (requested: ${item.quantity}):`,
+        String(currentApproved)
+      );
+      if (!qtyStr || isNaN(Number(qtyStr))) {
+        alert("Valid approved quantity is required.");
+        return;
+      }
+      const qtyNum = Number(qtyStr);
+      setItemEdits((prev) => ({
+        ...prev,
+        [item.id]: {
+          ...prev[item.id],
+          approved_qty: qtyNum,
+        },
+      }));
+
+      const { error } = await supabase
+        .from("purchase_request_items")
+        .update({
+          status: "approved",
+          approved_qty: qtyNum,
+        })
+        .eq("id", item.id);
+
+      if (error) {
+        console.error("Error updating item:", error);
+        setErrorMsg(`Error updating item: ${error.message}`);
+        return;
+      }
+
+      await logEvent({
+        event_type: "item_approved",
+        item_id: item.id,
+        comment: `Approved qty: ${qtyNum}`,
+      });
+
+      await loadRequest();
       return;
     }
 
-    let newStatus = item.status;
-    let approved_qty = item.approved_qty ?? 0;
-    let reject_comment = item.reject_comment;
-    let resubmit_comment = item.resubmit_comment;
-    let commentForLog: string | null = null;
-
-    if (action === "approve") {
-      // partial or full approval
-      const defaultQty =
-        item.approved_qty && item.approved_qty > 0
-          ? item.approved_qty
-          : maxQty;
-
-      const input = window.prompt(
-        `Enter quantity to APPROVE for this line (max ${maxQty}):`,
-        String(defaultQty)
-      );
-
-      if (input === null) {
-        // user cancelled
-        return;
-      }
-
-      const qty = Number(input);
-      if (!Number.isFinite(qty) || qty <= 0 || qty > maxQty) {
-        alert(`Please enter a number between 1 and ${maxQty}.`);
-        return;
-      }
-
-      approved_qty = qty;
-
-      if (qty === maxQty) {
-        newStatus = "approved";
-      } else {
-        newStatus = "partially_approved";
-      }
-
-      if (item.status === "rejected") {
-        const c = window.prompt(
-          "This line was previously rejected. Enter a note for re-approval:"
-        );
-        if (!c || !c.trim()) {
-          alert("A note is required to re-approve a rejected item.");
-          return;
-        }
-        resubmit_comment = c.trim();
-        commentForLog = resubmit_comment;
-      }
-    } else {
-      // full reject with comment
+    // reject path:
+    if (action === "reject") {
       const c = window.prompt(
         "Enter rejection comment for this line item (required):"
       );
@@ -404,19 +425,25 @@ export default function PurchaseRequestDetailPage() {
         alert("Rejection comment is required.");
         return;
       }
-      reject_comment = c.trim();
-      approved_qty = 0;
-      newStatus = "rejected";
-      commentForLog = reject_comment;
+      comment = c.trim();
+    } else if (item.status === "rejected") {
+      const c = window.prompt(
+        "This item was previously rejected. Enter special comment to approve it now:"
+      );
+      if (!c || !c.trim()) {
+        alert("Comment is required to re-approve a rejected item.");
+        return;
+      }
+      comment = c.trim();
     }
+
+    const newStatus = "rejected";
 
     const { error } = await supabase
       .from("purchase_request_items")
       .update({
         status: newStatus,
-        approved_qty,
-        reject_comment,
-        resubmit_comment,
+        reject_comment: comment,
       })
       .eq("id", item.id);
 
@@ -427,10 +454,94 @@ export default function PurchaseRequestDetailPage() {
     }
 
     await logEvent({
-      event_type:
-        action === "approve" ? "item_approved" : "item_rejected",
+      event_type: "item_rejected",
       item_id: item.id,
-      comment: commentForLog,
+      comment: comment,
+    });
+
+    await loadRequest();
+  };
+
+  // Save numeric quantities per line (partial purchase / delivery / receiving)
+  const handleSaveLineQuantities = async (item: RequestItem) => {
+    const edit = itemEdits[item.id];
+    if (!edit) return;
+
+    const payload: any = {};
+
+    if (edit.approved_qty !== undefined) payload.approved_qty = edit.approved_qty;
+    if (edit.purchased_qty !== undefined) payload.purchased_qty = edit.purchased_qty;
+    if (edit.delivered_qty !== undefined) payload.delivered_qty = edit.delivered_qty;
+    if (edit.received_qty !== undefined) payload.received_qty = edit.received_qty;
+
+    if (Object.keys(payload).length === 0) return;
+
+    const { error } = await supabase
+      .from("purchase_request_items")
+      .update(payload)
+      .eq("id", item.id);
+
+    if (error) {
+      console.error("Error saving line quantities:", error);
+      setErrorMsg(`Error saving line quantities: ${error.message}`);
+      return;
+    }
+
+    await logEvent({
+      event_type: "line_qty_update",
+      item_id: item.id,
+      comment: JSON.stringify(payload),
+    });
+
+    await loadRequest();
+  };
+
+  // Photo upload for received items
+  const handleReceivePhotoUpload = async (
+    item: RequestItem,
+    file: File,
+    which: 1 | 2
+  ) => {
+    if (!request) return;
+
+    const ext = file.name.split(".").pop();
+    const filePath = `request-${request.id}-item-${item.id}-recv-${which}-${Date.now()}.${ext}`;
+
+    const { data, error } = await supabase.storage
+      .from("item-images")
+      .upload(filePath, file, {
+        cacheControl: "3600",
+        upsert: false,
+      });
+
+    if (error) {
+      console.error("Error uploading receive photo:", error);
+      setErrorMsg("Error uploading received-item photo.");
+      return;
+    }
+
+    const { data: publicData } = supabase.storage
+      .from("item-images")
+      .getPublicUrl(data.path);
+
+    const fieldName =
+      which === 1 ? "received_image_url_1" : "received_image_url_2";
+
+    const { error: updErr } = await supabase
+      .from("purchase_request_items")
+      .update({ [fieldName]: publicData.publicUrl })
+      .eq("id", item.id);
+
+    if (updErr) {
+      console.error("Error saving receive photo URL:", updErr);
+      setErrorMsg("Error saving receive photo URL.");
+      return;
+    }
+
+    await logEvent({
+      event_type: "line_photo_upload",
+      item_id: item.id,
+      comment: `Uploaded receive photo ${which}`,
     });
 
     await loadRequest();
@@ -447,25 +558,45 @@ export default function PurchaseRequestDetailPage() {
       const freshItems = items; // current state
 
       for (const it of freshItems) {
-        if (it.status === "rejected") {
-          continue; // don't stock rejected lines
-        }
+        if (it.status === "rejected") continue; // don't stock rejected lines
 
-        const qtyToUse =
-          (it.approved_qty != null ? it.approved_qty : it.quantity) || 0;
-
-        if (qtyToUse <= 0) {
-          continue;
-        }
+        const qty = Number(it.received_qty ?? 0);
+        if (!qty || qty <= 0) continue; // only stock what was received
 
         if (it.item_id) {
-          // existing inventory item → update quantity (MVP: override or you can adjust to increment)
-          await supabase
+          // existing inventory item → increment quantity
+          const { data: stockItem, error: stockErr } = await supabase
+            .from("items")
+            .select("id, quantity, image_url, image_url_2, location, category")
+            .eq("id", it.item_id)
+            .single();
+
+          if (stockErr || !stockItem) {
+            console.error("Error loading stock item:", stockErr);
+            continue;
+          }
+
+          const newQty = (stockItem.quantity || 0) + qty;
+
+          const { error: updErr } = await supabase
             .from("items")
             .update({
-              quantity: qtyToUse,
+              quantity: newQty,
+              // if item has no photo yet, use received photos
+              image_url:
+                stockItem.image_url ||
+                it.received_image_url_1 ||
+                stockItem.image_url,
+              image_url_2:
+                stockItem.image_url_2 ||
+                it.received_image_url_2 ||
+                stockItem.image_url_2,
             })
             .eq("id", it.item_id);
+
+          if (updErr) {
+            console.error("Error updating stock item:", updErr);
+          }
         } else {
           // new inventory item
           const { data: newItem, error: newErr } = await supabase
@@ -474,12 +605,14 @@ export default function PurchaseRequestDetailPage() {
               user_id: userId,
               name: it.description,
               description: request.notes,
-              quantity: qtyToUse,
+              quantity: qty,
               location: it.application_location,
               category: null,
               te_number: null,
               purchase_price: it.est_unit_price,
               purchase_date: new Date().toISOString().slice(0, 10),
+              image_url: it.received_image_url_1,
+              image_url_2: it.received_image_url_2,
             })
             .select()
             .single();
@@ -535,15 +668,9 @@ export default function PurchaseRequestDetailPage() {
     );
   }
 
-  const totalEstRequested = items.reduce((sum, it) => {
+  const totalEst = items.reduce((sum, it) => {
     const price = it.est_unit_price || 0;
-    return sum + price * Number(it.quantity || 0);
-  }, 0);
-
-  const totalEstApproved = items.reduce((sum, it) => {
-    const price = it.est_unit_price || 0;
-    const qty = it.approved_qty != null ? it.approved_qty : 0;
-    return sum + price * qty;
+    return sum + price * Number(it.approved_qty ?? it.quantity ?? 0);
   }, 0);
 
   const currentStatusLabel = STATUS_LABEL[request.status] || request.status;
@@ -571,9 +698,7 @@ export default function PurchaseRequestDetailPage() {
               </p>
               <p className="text-xs text-slate-500">
                 Status: {currentStatusLabel}
-                {profile ? ` · Role: ${profile.role}` : ""}{" "}
-                {profile?.can_receive ? "· Receiver" : ""}
-                {profile?.can_purchase ? "· Purchaser" : ""}
+                {profile ? ` · Role: ${profile.role}` : ""}
               </p>
             </div>
           </div>
@@ -639,11 +764,10 @@ export default function PurchaseRequestDetailPage() {
             </div>
           )}
 
-          {/* Approver / purchaser / receiver actions */}
+          {/* Approver / workflow actions */}
           <div className="pt-3 border-t flex flex-wrap items-center gap-3 justify-between">
             <p className="text-xs text-slate-500">
-              Use the actions below to move this request through the workflow,
-              including partial approvals per item.
+              Use the actions below to move this request through the workflow.
             </p>
 
             <div className="flex flex-wrap gap-2">
@@ -697,7 +821,7 @@ export default function PurchaseRequestDetailPage() {
                   onClick={() => updateRequestStatus("received")}
                   className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-lime-600 text-white hover:bg-lime-700 disabled:opacity-60"
                 >
-                  Mark Received
+                  Mark Fully Received
                 </button>
               )}
 
@@ -718,19 +842,13 @@ export default function PurchaseRequestDetailPage() {
 
         {/* Line items */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
-          <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
               Line Items
             </h2>
-            <div className="text-xs text-slate-500 flex flex-col items-end">
-              <span className="inline-flex items-center gap-2">
-                <DollarSign className="w-3 h-3" />
-                Requested total: ${totalEstRequested.toFixed(2)}
-              </span>
-              <span className="inline-flex items-center gap-2">
-                <DollarSign className="w-3 h-3" />
-                Approved total: ${totalEstApproved.toFixed(2)}
-              </span>
+            <div className="text-xs text-slate-500 flex items-center gap-2">
+              <DollarSign className="w-3 h-3" />
+              Est. total: ${totalEst.toFixed(2)}
             </div>
           </div>
 
@@ -753,16 +871,10 @@ export default function PurchaseRequestDetailPage() {
                       Requested
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
-                      Approved
+                      Approved / Purchased / Delivered / Received
                     </th>
                     <th className="text-right px-3 py-2 font-medium">
-                      Est. Unit
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Est. Total (Req)
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Est. Total (Appr)
+                      Est. Prices
                     </th>
                     <th className="text-left px-3 py-2 font-medium">
                       Status
@@ -776,27 +888,22 @@ export default function PurchaseRequestDetailPage() {
                   {items.map((it) => {
                     const unit = it.unit || "ea";
                     const unitPrice = it.est_unit_price || 0;
-                    const reqQty = Number(it.quantity || 0);
-                    const apprQty =
-                      it.approved_qty != null ? Number(it.approved_qty) : 0;
-
-                    const reqTotal = unitPrice * reqQty;
-                    const apprTotal = unitPrice * apprQty;
+                    const baseQty = it.approved_qty ?? it.quantity;
+                    const lineTotal = unitPrice * Number(baseQty || 0);
 
                     const statusBadge =
                       it.status === "approved"
                         ? "bg-emerald-100 text-emerald-700"
-                        : it.status === "partially_approved"
-                        ? "bg-blue-100 text-blue-700"
                         : it.status === "rejected"
                         ? "bg-red-100 text-red-700"
                         : "bg-slate-100 text-slate-700";
 
-                    const canActOnItem =
-                      canApproveReject || isAdmin;
+                    const canActOnItem = canApproveReject || profile?.role === "admin";
+
+                    const editState = itemEdits[it.id] || {};
 
                     return (
-                      <tr key={it.id} className="border-b last:border-0">
+                      <tr key={it.id} className="border-b last:border-0 align-top">
                         <td className="px-3 py-2 align-top">
                           <div className="flex flex-col gap-0.5">
                             <span className="font-medium text-slate-900">
@@ -817,29 +924,211 @@ export default function PurchaseRequestDetailPage() {
                                 Re-approval note: {it.resubmit_comment}
                               </span>
                             )}
+
+                            {/* Received photos preview */}
+                            {(it.received_image_url_1 ||
+                              it.received_image_url_2) && (
+                              <div className="mt-1 flex gap-1">
+                                {it.received_image_url_1 && (
+                                  <img
+                                    src={it.received_image_url_1}
+                                    alt="Received 1"
+                                    className="w-10 h-10 rounded border object-cover"
+                                  />
+                                )}
+                                {it.received_image_url_2 && (
+                                  <img
+                                    src={it.received_image_url_2}
+                                    alt="Received 2"
+                                    className="w-10 h-10 rounded border object-cover"
+                                  />
+                                )}
+                              </div>
+                            )}
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top">
                           <div className="flex items-center gap-1 text-slate-600">
                             <MapPin className="w-3 h-3" />
                             <span>{it.application_location || "-"}</span>
                           </div>
                         </td>
+
                         <td className="px-3 py-2 align-top text-right">
-                          {reqQty} {unit}
+                          {Number(it.quantity)} {unit}
                         </td>
+
+                        {/* quantities block */}
                         <td className="px-3 py-2 align-top text-right">
-                          {apprQty > 0 ? `${apprQty} ${unit}` : "-"}
+                          <div className="flex flex-col items-end gap-1 text-[11px]">
+                            <div className="flex flex-col items-end gap-1">
+                              <div>
+                                <span className="mr-1 text-slate-500">
+                                  Approved:
+                                </span>
+                                <input
+                                  type="number"
+                                  className="w-20 border rounded px-1 py-0.5 text-right"
+                                  value={
+                                    editState.approved_qty ??
+                                    it.approved_qty ??
+                                    ""
+                                  }
+                                  onChange={(e) =>
+                                    setItemEdits((prev) => ({
+                                      ...prev,
+                                      [it.id]: {
+                                        ...prev[it.id],
+                                        approved_qty:
+                                          e.target.value === ""
+                                            ? null
+                                            : Number(e.target.value),
+                                      },
+                                    }))
+                                  }
+                                />
+                              </div>
+                              <div>
+                                <span className="mr-1 text-slate-500">
+                                  Purchased:
+                                </span>
+                                <input
+                                  type="number"
+                                  className="w-20 border rounded px-1 py-0.5 text-right"
+                                  value={
+                                    editState.purchased_qty ??
+                                    it.purchased_qty ??
+                                    ""
+                                  }
+                                  onChange={(e) =>
+                                    setItemEdits((prev) => ({
+                                      ...prev,
+                                      [it.id]: {
+                                        ...prev[it.id],
+                                        purchased_qty:
+                                          e.target.value === ""
+                                            ? null
+                                            : Number(e.target.value),
+                                      },
+                                    }))
+                                  }
+                                />
+                              </div>
+                              <div>
+                                <span className="mr-1 text-slate-500">
+                                  Delivered:
+                                </span>
+                                <input
+                                  type="number"
+                                  className="w-20 border rounded px-1 py-0.5 text-right"
+                                  value={
+                                    editState.delivered_qty ??
+                                    it.delivered_qty ??
+                                    ""
+                                  }
+                                  onChange={(e) =>
+                                    setItemEdits((prev) => ({
+                                      ...prev,
+                                      [it.id]: {
+                                        ...prev[it.id],
+                                        delivered_qty:
+                                          e.target.value === ""
+                                            ? null
+                                            : Number(e.target.value),
+                                      },
+                                    }))
+                                  }
+                                />
+                              </div>
+                              <div>
+                                <span className="mr-1 text-slate-500">
+                                  Received:
+                                </span>
+                                <input
+                                  type="number"
+                                  className="w-20 border rounded px-1 py-0.5 text-right"
+                                  value={
+                                    editState.received_qty ??
+                                    it.received_qty ??
+                                    ""
+                                  }
+                                  onChange={(e) =>
+                                    setItemEdits((prev) => ({
+                                      ...prev,
+                                      [it.id]: {
+                                        ...prev[it.id],
+                                        received_qty:
+                                          e.target.value === ""
+                                            ? null
+                                            : Number(e.target.value),
+                                      },
+                                    }))
+                                  }
+                                />
+                              </div>
+                            </div>
+
+                            {canMarkReceived && (
+                              <div className="mt-1 flex flex-col items-end gap-1">
+                                <span className="text-slate-500">
+                                  Receive photos:
+                                </span>
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  capture="environment"
+                                  className="text-[10px]"
+                                  onChange={(e) => {
+                                    if (e.target.files?.[0]) {
+                                      handleReceivePhotoUpload(
+                                        it,
+                                        e.target.files[0],
+                                        1
+                                      );
+                                    }
+                                  }}
+                                />
+                                <input
+                                  type="file"
+                                  accept="image/*"
+                                  capture="environment"
+                                  className="text-[10px]"
+                                  onChange={(e) => {
+                                    if (e.target.files?.[0]) {
+                                      handleReceivePhotoUpload(
+                                        it,
+                                        e.target.files[0],
+                                        2
+                                      );
+                                    }
+                                  }}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleSaveLineQuantities(it)
+                                  }
+                                  className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-lime-50 text-lime-700 hover:bg-lime-100"
+                                >
+                                  Save line
+                                </button>
+                              </div>
+                            )}
+                          </div>
                         </td>
+
                         <td className="px-3 py-2 align-top text-right">
-                          {unitPrice ? `$${unitPrice.toFixed(2)}` : "-"}
+                          <div className="flex flex-col items-end">
+                            <span>
+                              {unitPrice ? `$${unitPrice.toFixed(2)}` : "-"}
+                            </span>
+                            <span className="font-semibold text-slate-900">
+                              {lineTotal ? `$${lineTotal.toFixed(2)}` : "-"}
+                            </span>
+                          </div>
                         </td>
-                        <td className="px-3 py-2 align-top text-right">
-                          {reqTotal ? `$${reqTotal.toFixed(2)}` : "-"}
-                        </td>
-                        <td className="px-3 py-2 align-top text-right font-semibold text-slate-900">
-                          {apprTotal ? `$${apprTotal.toFixed(2)}` : "-"}
-                        </td>
+
                         <td className="px-3 py-2 align-top">
                           <span
                             className={`inline-flex px-2 py-0.5 rounded-full ${statusBadge}`}
@@ -847,6 +1136,7 @@ export default function PurchaseRequestDetailPage() {
                             {it.status}
                           </span>
                         </td>
+
                         <td className="px-3 py-2 align-top text-right">
                           {canActOnItem && (
                             <div className="flex flex-col gap-1 items-end">
@@ -857,7 +1147,7 @@ export default function PurchaseRequestDetailPage() {
                                 }
                                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                               >
-                                Approve (qty)
+                                Approve
                               </button>
                               <button
                                 type="button"
@@ -868,6 +1158,17 @@ export default function PurchaseRequestDetailPage() {
                               >
                                 Reject
                               </button>
+                              {!canMarkReceived && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleSaveLineQuantities(it)
+                                  }
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-slate-50 text-slate-700 hover:bg-slate-100"
+                                >
+                                  Save line
+                                </button>
+                              )}
                             </div>
                           )}
                         </td>
@@ -879,14 +1180,13 @@ export default function PurchaseRequestDetailPage() {
             </div>
           )}
 
-          {items.length > 0 &&
-            !items.some((i) => i.est_unit_price) && (
-              <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-center gap-2">
-                <AlertCircle className="w-3 h-3" />
-                No estimated prices entered; totals are 0. You can still use
-                this for quantity-only approvals.
-              </div>
-            )}
+          {items.length > 0 && !items.some((i) => i.est_unit_price) && (
+            <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-center gap-2">
+              <AlertCircle className="w-3 h-3" />
+              No estimated prices entered; total is 0. Approvers may still use
+              this for scope/quantity only.
+            </div>
+          )}
         </section>
       </main>
     </div>

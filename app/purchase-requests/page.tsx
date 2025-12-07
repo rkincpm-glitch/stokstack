@@ -36,6 +36,8 @@ type Profile = {
   id: string;
   role: string;
   display_name: string | null;
+  can_purchase: boolean;
+  can_receive: boolean;
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -64,12 +66,18 @@ export default function PurchaseRequestsPage() {
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [myRequests, setMyRequests] = useState<RequestWithProject[]>([]);
-  const [pendingApprovals, setPendingApprovals] = useState<RequestWithProject[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<
+    RequestWithProject[]
+  >([]);
+  const [involvedRequests, setInvolvedRequests] = useState<
+    RequestWithProject[]
+  >([]);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
     loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadData = async () => {
@@ -86,28 +94,42 @@ export default function PurchaseRequestsPage() {
     // 1) Profile / role
     let role = "requester";
     let displayName: string | null = null;
+    let can_purchase = false;
+    let can_receive = false;
 
     const { data: profData, error: profError } = await supabase
       .from("profiles")
-      .select("id, role, display_name")
+      .select("id, role, display_name, can_purchase, can_receive")
       .eq("id", userId)
       .maybeSingle();
 
     if (!profError && profData) {
       role = profData.role || "requester";
       displayName = profData.display_name || null;
+      can_purchase = !!profData.can_purchase;
+      can_receive = !!profData.can_receive;
     } else if (!profData) {
       // auto-create basic profile if missing
       await supabase.from("profiles").insert({
         id: userId,
         role: "requester",
+        display_name: userData.user.email,
+        is_active: true,
+        can_purchase: false,
+        can_receive: false,
       });
     }
 
-    const myProfile: Profile = { id: userId, role, display_name: displayName };
+    const myProfile: Profile = {
+      id: userId,
+      role,
+      display_name: displayName,
+      can_purchase,
+      can_receive,
+    };
     setProfile(myProfile);
 
-    // 2) Load projects
+    // 2) Load projects (map for join)
     const { data: projData, error: projError } = await supabase
       .from("projects")
       .select("id, name, code");
@@ -156,12 +178,18 @@ export default function PurchaseRequestsPage() {
       statusFilter = ["submitted"];
     } else if (role === "president") {
       statusFilter = ["pm_approved"];
-    } else if (role === "purchaser") {
+    } else if (can_purchase || role === "purchaser") {
       statusFilter = ["president_approved"];
-    } else if (role === "receiver") {
+    } else if (can_receive) {
       statusFilter = ["purchased", "delivered"];
     } else if (role === "admin") {
-      statusFilter = ["submitted", "pm_approved", "president_approved", "purchased", "delivered"];
+      statusFilter = [
+        "submitted",
+        "pm_approved",
+        "president_approved",
+        "purchased",
+        "delivered",
+      ];
     }
 
     if (statusFilter.length > 0) {
@@ -178,18 +206,56 @@ export default function PurchaseRequestsPage() {
         return;
       }
 
-      const pendWithProj: RequestWithProject[] = (pendingData || []).map((r) => {
-        const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
-        return {
-          ...(r as PurchaseRequest),
-          project_name: proj?.name || null,
-          project_code: proj?.code || null,
-        };
-      });
+      const pendWithProj: RequestWithProject[] = (pendingData || []).map(
+        (r) => {
+          const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
+          return {
+            ...(r as PurchaseRequest),
+            project_name: proj?.name || null,
+            project_code: proj?.code || null,
+          };
+        }
+      );
 
       setPendingApprovals(pendWithProj);
     } else {
       setPendingApprovals([]);
+    }
+
+    // 5) Involved history (any request where I performed an event)
+    const { data: evData, error: evError } = await supabase
+      .from("purchase_request_events")
+      .select("request_id")
+      .eq("performed_by", userId);
+
+    if (!evError && evData && evData.length > 0) {
+      const ids = Array.from(
+        new Set(evData.map((e: any) => e.request_id))
+      ) as string[];
+
+      if (ids.length > 0) {
+        const { data: involvedData, error: invError } = await supabase
+          .from("purchase_requests")
+          .select("*")
+          .in("id", ids)
+          .order("created_at", { ascending: false });
+
+        if (!invError && involvedData) {
+          const involved: RequestWithProject[] = involvedData.map((r) => {
+            const proj = r.project_id
+              ? projectMap.get(r.project_id)
+              : undefined;
+            return {
+              ...(r as PurchaseRequest),
+              project_name: proj?.name || null,
+              project_code: proj?.code || null,
+            };
+          });
+
+          // Avoid duplicating myRequests – but it's okay if some overlap.
+          setInvolvedRequests(involved);
+        }
+      }
     }
 
     setLoading(false);
@@ -341,18 +407,32 @@ export default function PurchaseRequestsPage() {
             </section>
 
             {/* Pending approvals */}
-            {profile && profile.role !== "requester" && (
+            {profile && (
               <section className="space-y-2">
                 <h2 className="text-sm font-semibold text-slate-800">
-                  Needs My Approval
+                  Needs My Action
                 </h2>
                 {pendingApprovals.length === 0 ? (
                   <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">
-                    No requests waiting for your approval.
+                    No requests waiting for your approval/processing.
                   </div>
                 ) : (
                   renderTable(pendingApprovals)
                 )}
+              </section>
+            )}
+
+            {/* Involved history */}
+            {profile && involvedRequests.length > 0 && (
+              <section className="space-y-2">
+                <h2 className="text-sm font-semibold text-slate-800">
+                  History: Requests I Touched
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  Requests where you were involved (approved, rejected, purchased,
+                  delivered, received, etc.). May overlap with sections above.
+                </p>
+                {renderTable(involvedRequests)}
               </section>
             )}
           </>
