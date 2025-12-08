@@ -15,19 +15,32 @@ import {
 type ProfileRow = {
   id: string;
   display_name: string | null;
-  role: string;
+  roles: string[];   // multi-role
   is_active: boolean;
-  can_purchase: boolean;
-  can_receive: boolean;
 };
 
-const ROLE_OPTIONS = [
+const ALL_ROLES = [
   "requester",
   "pm",
   "president",
   "purchaser",
+  "receiver",
   "admin",
 ];
+
+function parseRoles(value: string | null): string[] {
+  if (!value) return ["requester"];
+  return value
+    .split(",")
+    .map((r) => r.trim())
+    .filter((r) => r.length > 0);
+}
+
+function stringifyRoles(roles: string[]): string {
+  // Ensure at least requester
+  if (roles.length === 0) return "requester";
+  return Array.from(new Set(roles)).join(",");
+}
 
 export default function AdminUsersPage() {
   const router = useRouter();
@@ -62,23 +75,20 @@ export default function AdminUsersPage() {
     // 1) Ensure current user has a profile
     let { data: prof, error: profError } = await supabase
       .from("profiles")
-      .select("id, role, display_name, is_active, can_purchase, can_receive")
+      .select("id, role, display_name, is_active")
       .eq("id", userId)
       .maybeSingle();
 
     if (!prof && !profError) {
-      // create default requester profile with email as display_name
       const { data: newProf } = await supabase
         .from("profiles")
         .insert({
           id: userId,
-          role: "requester",
+          role: "admin", // bootstrap first login as admin
           display_name: email,
           is_active: true,
-          can_purchase: false,
-          can_receive: false,
         })
-        .select("id, role, display_name, is_active, can_purchase, can_receive")
+        .select("id, role, display_name, is_active")
         .single();
       prof = newProf;
     }
@@ -92,7 +102,7 @@ export default function AdminUsersPage() {
     // 2) Load all profiles
     const { data: allProfiles, error: allError } = await supabase
       .from("profiles")
-      .select("id, role, display_name, is_active, can_purchase, can_receive, created_at")
+      .select("id, role, display_name, is_active, created_at")
       .order("created_at", { ascending: true });
 
     if (allError) {
@@ -103,15 +113,16 @@ export default function AdminUsersPage() {
     }
 
     let profiles = allProfiles as any[];
-    const anyAdmin = profiles.some((p) => p.role === "admin");
+    const anyAdmin = profiles.some((p) =>
+      parseRoles(p.role).includes("admin")
+    );
 
     // 3) Bootstrap: if no admin exists yet, make THIS user admin
     if (!anyAdmin) {
       const { error: updErr } = await supabase
         .from("profiles")
         .update({ role: "admin" })
-        .eq("id", userId);
-
+        .where("id", "eq", userId); // some clients don't allow .where; fallback to .eq
       if (!updErr) {
         prof.role = "admin";
         profiles = profiles.map((p) =>
@@ -120,38 +131,46 @@ export default function AdminUsersPage() {
       }
     }
 
+    const currentRoles = parseRoles(prof.role);
     const currentProfile: ProfileRow = {
       id: prof.id,
-      role: prof.role || "requester",
+      roles: currentRoles,
       display_name: prof.display_name || email,
       is_active: prof.is_active ?? true,
-      can_purchase: !!prof.can_purchase,
-      can_receive: !!prof.can_receive,
     };
     setAuthProfile(currentProfile);
 
     // If still not admin after bootstrap, no access
-    if (currentProfile.role !== "admin") {
+    if (!currentRoles.includes("admin")) {
       setLoading(false);
-      return; // will render "Not authorized"
+      return;
     }
 
     const rowsNormalized: ProfileRow[] = profiles.map((p) => ({
       id: p.id,
-      role: p.role,
+      roles: parseRoles(p.role),
       display_name: p.display_name || p.id,
       is_active: p.is_active ?? true,
-      can_purchase: !!p.can_purchase,
-      can_receive: !!p.can_receive,
     }));
 
     setRows(rowsNormalized);
     setLoading(false);
   };
 
-  const handleRoleChange = (id: string, role: string) => {
+  const toggleRole = (id: string, role: string) => {
     setRows((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, role } : r))
+      prev.map((r) => {
+        if (r.id !== id) return r;
+        let nextRoles = [...r.roles];
+        if (nextRoles.includes(role)) {
+          nextRoles = nextRoles.filter((rr) => rr !== role);
+        } else {
+          nextRoles.push(role);
+        }
+        // Always keep requester if user has no roles
+        if (nextRoles.length === 0) nextRoles = ["requester"];
+        return { ...r, roles: nextRoles };
+      })
     );
   };
 
@@ -161,18 +180,8 @@ export default function AdminUsersPage() {
     );
   };
 
-  const handleCapabilityChange = (id: string, field: "can_purchase" | "can_receive", value: boolean) => {
-    setRows((prev) =>
-      prev.map((r) =>
-        r.id === id ? { ...r, [field]: value } : r
-      )
-    );
-  };
-
   const handleToggleActive = async (row: ProfileRow) => {
     if (!authProfile) return;
-
-    // 🚫 Prevent admin from disabling their own account
     if (row.id === authProfile.id && row.is_active) {
       setErrorMsg("You cannot disable your own admin account.");
       return;
@@ -193,9 +202,7 @@ export default function AdminUsersPage() {
       }
 
       setRows((prev) =>
-        prev.map((r) =>
-          r.id === row.id ? { ...r, is_active: next } : r
-        )
+        prev.map((r) => (r.id === row.id ? { ...r, is_active: next } : r))
       );
     } catch (err) {
       console.error(err);
@@ -207,8 +214,8 @@ export default function AdminUsersPage() {
     setSaveStatus("saving");
     setErrorMsg(null);
 
-    // 🔍 1) Check for duplicate display_name (case-insensitive)
-    const seen = new Map<string, number>(); // name -> count
+    // Ensure unique display_name
+    const seen = new Map<string, number>();
     const dups = new Set<string>();
 
     for (const row of rows) {
@@ -216,9 +223,7 @@ export default function AdminUsersPage() {
       if (!name) continue;
       const count = (seen.get(name) || 0) + 1;
       seen.set(name, count);
-      if (count > 1) {
-        dups.add(name);
-      }
+      if (count > 1) dups.add(name);
     }
 
     if (dups.size > 0) {
@@ -232,17 +237,14 @@ export default function AdminUsersPage() {
       return;
     }
 
-    // 2) Save to Supabase
     try {
       for (const row of rows) {
         await supabase
           .from("profiles")
           .update({
-            role: row.role,
+            role: stringifyRoles(row.roles),
             display_name: row.display_name,
             is_active: row.is_active,
-            can_purchase: !!row.can_purchase,
-            can_receive: !!row.can_receive,
           })
           .eq("id", row.id);
       }
@@ -251,7 +253,6 @@ export default function AdminUsersPage() {
       console.error(err);
       setErrorMsg("Error saving changes.");
       setSaveStatus("idle");
-      return;
     }
   };
 
@@ -271,7 +272,7 @@ export default function AdminUsersPage() {
     );
   }
 
-  if (authProfile.role !== "admin") {
+  if (!authProfile.roles.includes("admin")) {
     return (
       <div className="min-h-screen bg-slate-50">
         <header className="bg-white border-b border-slate-200">
@@ -321,9 +322,7 @@ export default function AdminUsersPage() {
               <p className="text-sm font-semibold text-slate-900">
                 User Management
               </p>
-              <p className="text-xs text-slate-500">
-                Signed in as admin
-              </p>
+              <p className="text-xs text-slate-500">Signed in as admin</p>
             </div>
           </div>
         </div>
@@ -341,12 +340,12 @@ export default function AdminUsersPage() {
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="text-sm text-slate-700">
               <p className="font-semibold mb-1">
-                Manage users for StokStak
+                Manage users for stokstak
               </p>
               <p className="text-xs text-slate-500">
-                Users sign up via the login page. Admins can then set their
-                role, name, and toggle extra capabilities like purchasing or
-                receiving here. Display names must be unique to avoid confusion.
+                Users sign up via the login page. Admins can then assign
+                multiple roles like requester, purchaser, receiver, etc.  
+                Display names must be unique.
               </p>
             </div>
 
@@ -371,8 +370,7 @@ export default function AdminUsersPage() {
                 <tr className="text-xs text-slate-500 text-left">
                   <th className="px-3 py-2">User (name / email)</th>
                   <th className="px-3 py-2">User ID</th>
-                  <th className="px-3 py-2">Role</th>
-                  <th className="px-3 py-2">Capabilities</th>
+                  <th className="px-3 py-2">Roles</th>
                   <th className="px-3 py-2 text-right">Status</th>
                 </tr>
               </thead>
@@ -409,57 +407,33 @@ export default function AdminUsersPage() {
                         </p>
                       </td>
                       <td className="px-3 py-2 align-top">
-                        <select
-                          value={row.role}
-                          onChange={(e) =>
-                            handleRoleChange(row.id, e.target.value)
-                          }
-                          className={`px-2 py-1 border rounded-lg text-xs ${
-                            inactive
-                              ? "bg-slate-100 text-slate-400"
-                              : "bg-white"
-                          }`}
-                          disabled={inactive}
-                        >
-                          {ROLE_OPTIONS.map((role) => (
-                            <option key={role} value={role}>
-                              {role}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                      <td className="px-3 py-2 align-top">
-                        <div className="flex flex-col gap-1 text-[11px]">
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={row.can_purchase}
-                              disabled={inactive}
-                              onChange={(e) =>
-                                handleCapabilityChange(
-                                  row.id,
-                                  "can_purchase",
-                                  e.target.checked
-                                )
-                              }
-                            />
-                            <span>Can purchase</span>
-                          </label>
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={row.can_receive}
-                              disabled={inactive}
-                              onChange={(e) =>
-                                handleCapabilityChange(
-                                  row.id,
-                                  "can_receive",
-                                  e.target.checked
-                                )
-                              }
-                            />
-                            <span>Can receive</span>
-                          </label>
+                        <div className="flex flex-wrap gap-1">
+                          {ALL_ROLES.map((role) => {
+                            const checked = row.roles.includes(role);
+                            return (
+                              <label
+                                key={role}
+                                className={`flex items-center gap-1 px-2 py-1 rounded-full text-[11px] border cursor-pointer ${
+                                  checked
+                                    ? "bg-emerald-50 border-emerald-300 text-emerald-700"
+                                    : "bg-white border-slate-200 text-slate-500"
+                                } ${
+                                  inactive
+                                    ? "opacity-60 cursor-not-allowed"
+                                    : ""
+                                }`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="hidden"
+                                  checked={checked}
+                                  disabled={inactive}
+                                  onChange={() => toggleRole(row.id, role)}
+                                />
+                                <span>{role}</span>
+                              </label>
+                            );
+                          })}
                         </div>
                       </td>
                       <td className="px-3 py-2 align-top text-right">
@@ -502,7 +476,7 @@ export default function AdminUsersPage() {
           <p className="text-[11px] text-slate-400">
             🔑 <strong>Create users:</strong> they sign up on the login page
             (email/password). A profile is created automatically on first
-            login. Admin then assigns roles and capabilities here.  
+            login. Admin then assigns roles here.  
             ❌ <strong>Hard delete:</strong> removing auth accounts requires
             a secure backend; use “Disable” instead.
           </p>
