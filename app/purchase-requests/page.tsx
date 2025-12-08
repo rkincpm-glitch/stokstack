@@ -9,29 +9,25 @@ import {
   ClipboardList,
   Calendar,
   Plus,
+  ChevronDown,
+  Clock,
 } from "lucide-react";
-
-type Project = {
-  id: string;
-  name: string;
-  code: string | null;
-};
 
 type PurchaseRequest = {
   id: string;
+  pur_number: string | null;
   project_id: string | null;
   requested_by: string | null;
   status: string;
   needed_by: string | null;
   created_at: string;
   notes: string | null;
-  // optional PR number like "PUR-00101"
-  request_number?: string | null;
-  // for "involved" logic
-  pm_approved_by?: string | null;
-  president_approved_by?: string | null;
-  purchased_by?: string | null;
-  received_by?: string | null;
+};
+
+type Project = {
+  id: string;
+  name: string;
+  code: string | null;
 };
 
 type RequestWithProject = PurchaseRequest & {
@@ -52,7 +48,6 @@ const STATUS_LABEL: Record<string, string> = {
   purchased: "Purchased",
   received: "Received",
   rejected: "Rejected",
-  stocked: "Stocked in StokStak",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -61,9 +56,10 @@ const STATUS_COLOR: Record<string, string> = {
   president_approved: "bg-purple-100 text-purple-700",
   purchased: "bg-emerald-100 text-emerald-700",
   received: "bg-green-100 text-green-700",
-  stocked: "bg-slate-900 text-white",
   rejected: "bg-red-100 text-red-700",
 };
+
+const CLOSED_STATUSES = ["received", "rejected"];
 
 export default function PurchaseRequestsPage() {
   const router = useRouter();
@@ -71,12 +67,16 @@ export default function PurchaseRequestsPage() {
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [myRequests, setMyRequests] = useState<RequestWithProject[]>([]);
-  const [pendingApprovals, setPendingApprovals] = useState<RequestWithProject[]>([]);
-
+  const [pendingApprovals, setPendingApprovals] = useState<RequestWithProject[]>(
+    []
+  );
+  const [historyRequests, setHistoryRequests] = useState<RequestWithProject[]>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
 
   useEffect(() => {
     loadData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadData = async () => {
@@ -131,19 +131,11 @@ export default function PurchaseRequestsPage() {
       projectMap.set(p.id, p as Project);
     });
 
-    // 3) All requests where I am involved (history)
+    // 3) My requests (where I am the requester)
     const { data: myReqData, error: myReqError } = await supabase
       .from("purchase_requests")
       .select("*")
-      .or(
-        [
-          `requested_by.eq.${userId}`,
-          `pm_approved_by.eq.${userId}`,
-          `president_approved_by.eq.${userId}`,
-          `purchased_by.eq.${userId}`,
-          `received_by.eq.${userId}`,
-        ].join(",")
-      )
+      .eq("requested_by", userId)
       .order("created_at", { ascending: false });
 
     if (myReqError) {
@@ -164,6 +156,10 @@ export default function PurchaseRequestsPage() {
 
     setMyRequests(myWithProj);
 
+    // Open vs closed requests (for requester’s own)
+    const history = myWithProj.filter((r) => CLOSED_STATUSES.includes(r.status));
+    setHistoryRequests(history);
+
     // 4) Pending approvals for my role
     let statusFilter: string[] = [];
 
@@ -174,7 +170,12 @@ export default function PurchaseRequestsPage() {
     } else if (role === "purchaser") {
       statusFilter = ["president_approved"];
     } else if (role === "admin") {
-      statusFilter = ["submitted", "pm_approved", "president_approved", "purchased", "received"];
+      statusFilter = [
+        "submitted",
+        "pm_approved",
+        "president_approved",
+        "purchased",
+      ];
     }
 
     if (statusFilter.length > 0) {
@@ -182,7 +183,7 @@ export default function PurchaseRequestsPage() {
         .from("purchase_requests")
         .select("*")
         .in("status", statusFilter)
-        .order("created_at", { ascending: false });
+        .order("created_at", { ascending: true }); // oldest first for attention
 
       if (pendingError) {
         console.error(pendingError);
@@ -212,7 +213,7 @@ export default function PurchaseRequestsPage() {
     if (list.length === 0) {
       return (
         <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">
-          Nothing here.
+          Nothing here yet.
         </div>
       );
     }
@@ -223,7 +224,7 @@ export default function PurchaseRequestsPage() {
           <table className="w-full text-sm">
             <thead className="bg-slate-50 border-b">
               <tr className="text-left text-xs text-slate-500">
-                <th className="px-4 py-2">PR No</th>
+                <th className="px-4 py-2">Requisition</th>
                 <th className="px-4 py-2">Project</th>
                 <th className="px-4 py-2">Status</th>
                 <th className="px-4 py-2">Needed By</th>
@@ -235,17 +236,22 @@ export default function PurchaseRequestsPage() {
               {list.map((r) => {
                 const statusClass =
                   STATUS_COLOR[r.status] || "bg-slate-100 text-slate-700";
-                const prNumber =
-                  r.request_number ||
-                  `PUR-${r.id.slice(0, 8).toUpperCase()}`;
-
                 return (
                   <tr
                     key={r.id}
                     className="border-b last:border-0 hover:bg-slate-50"
                   >
-                    <td className="px-4 py-3 text-xs font-mono text-slate-700">
-                      {prNumber}
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col">
+                        <span className="font-semibold text-slate-900">
+                          {r.pur_number || "Unnumbered"}
+                        </span>
+                        {r.notes && (
+                          <span className="text-[11px] text-slate-500 line-clamp-1">
+                            {r.notes}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex flex-col">
@@ -297,6 +303,10 @@ export default function PurchaseRequestsPage() {
     );
   };
 
+  const myOpenRequests = myRequests.filter(
+    (r) => !CLOSED_STATUSES.includes(r.status)
+  );
+
   return (
     <div className="min-h-screen bg-slate-50">
       {/* Header */}
@@ -328,9 +338,9 @@ export default function PurchaseRequestsPage() {
 
       {/* Main */}
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-2">
           <p className="text-sm text-slate-600">
-            {myRequests.length} requests you are involved in
+            Track and approve purchase requisitions for Stokstak.
           </p>
           <Link
             href="/purchase-requests/new"
@@ -353,29 +363,66 @@ export default function PurchaseRequestsPage() {
           </div>
         ) : (
           <>
-            {/* My / involved requests */}
+            {/* Needs My Attention */}
             <section className="space-y-2">
-              <h2 className="text-sm font-semibold text-slate-800">
-                My Requests & History
-              </h2>
-              {renderTable(myRequests)}
-            </section>
-
-            {/* Pending approvals */}
-            {profile && profile.role !== "requester" && (
-              <section className="space-y-2">
-                <h2 className="text-sm font-semibold text-slate-800">
-                  Needs My Action
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-slate-800 flex items-center gap-1">
+                  <Clock className="w-4 h-4 text-amber-500" />
+                  Needs My Attention
                 </h2>
-                {pendingApprovals.length === 0 ? (
+                <span className="text-xs text-slate-500">
+                  {pendingApprovals.length} open
+                </span>
+              </div>
+              {profile && profile.role !== "requester" ? (
+                pendingApprovals.length === 0 ? (
                   <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">
-                    No requests waiting for your approval.
+                    Nothing needs your approval right now.
                   </div>
                 ) : (
                   renderTable(pendingApprovals)
-                )}
-              </section>
-            )}
+                )
+              ) : (
+                <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">
+                  You do not have an approver role. Your own requests are below.
+                </div>
+              )}
+            </section>
+
+            {/* My open requests */}
+            <section className="space-y-2">
+              <h2 className="text-sm font-semibold text-slate-800">
+                My Open Requests
+              </h2>
+              {renderTable(myOpenRequests)}
+            </section>
+
+            {/* History (collapsed) */}
+            <section className="space-y-2">
+              <button
+                type="button"
+                onClick={() => setShowHistory((v) => !v)}
+                className="w-full flex items-center justify-between px-3 py-2 bg-transparent border border-slate-200 rounded-lg text-xs text-slate-600 hover:bg-slate-50"
+              >
+                <span className="flex items-center gap-2">
+                  <ChevronDown
+                    className={`w-4 h-4 transition-transform ${
+                      showHistory ? "rotate-180" : ""
+                    }`}
+                  />
+                  History ({historyRequests.length})
+                </span>
+                <span className="text-[11px] text-slate-400">
+                  Completed / rejected requests are kept here for audit.
+                </span>
+              </button>
+
+              {showHistory && (
+                <div className="mt-2">
+                  {renderTable(historyRequests)}
+                </div>
+              )}
+            </section>
           </>
         )}
       </main>
