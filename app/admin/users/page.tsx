@@ -4,22 +4,16 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
-import {
-  ArrowLeft,
-  Users,
-  Save,
-  Ban,
-  RotateCcw,
-} from "lucide-react";
+import { ArrowLeft, Users, Save, Ban, RotateCcw } from "lucide-react";
 
 type ProfileRow = {
   id: string;
   display_name: string | null;
-  roles: string[];   // multi-role
+  role: string;
   is_active: boolean;
 };
 
-const ALL_ROLES = [
+const ROLE_OPTIONS = [
   "requester",
   "pm",
   "president",
@@ -27,20 +21,6 @@ const ALL_ROLES = [
   "receiver",
   "admin",
 ];
-
-function parseRoles(value: string | null): string[] {
-  if (!value) return ["requester"];
-  return value
-    .split(",")
-    .map((r) => r.trim())
-    .filter((r) => r.length > 0);
-}
-
-function stringifyRoles(roles: string[]): string {
-  // Ensure at least requester
-  if (roles.length === 0) return "requester";
-  return Array.from(new Set(roles)).join(",");
-}
 
 export default function AdminUsersPage() {
   const router = useRouter();
@@ -80,11 +60,12 @@ export default function AdminUsersPage() {
       .maybeSingle();
 
     if (!prof && !profError) {
+      // create default requester profile with email as display_name
       const { data: newProf } = await supabase
         .from("profiles")
         .insert({
           id: userId,
-          role: "admin", // bootstrap first login as admin
+          role: "requester",
           display_name: email,
           is_active: true,
         })
@@ -113,16 +94,15 @@ export default function AdminUsersPage() {
     }
 
     let profiles = allProfiles as any[];
-    const anyAdmin = profiles.some((p) =>
-      parseRoles(p.role).includes("admin")
-    );
+    const anyAdmin = profiles.some((p) => p.role === "admin");
 
     // 3) Bootstrap: if no admin exists yet, make THIS user admin
     if (!anyAdmin) {
       const { error: updErr } = await supabase
         .from("profiles")
         .update({ role: "admin" })
-        .where("id", "eq", userId); // some clients don't allow .where; fallback to .eq
+        .eq("id", userId); // use .eq instead of .where
+
       if (!updErr) {
         prof.role = "admin";
         profiles = profiles.map((p) =>
@@ -131,24 +111,23 @@ export default function AdminUsersPage() {
       }
     }
 
-    const currentRoles = parseRoles(prof.role);
     const currentProfile: ProfileRow = {
       id: prof.id,
-      roles: currentRoles,
+      role: prof.role || "requester",
       display_name: prof.display_name || email,
       is_active: prof.is_active ?? true,
     };
     setAuthProfile(currentProfile);
 
     // If still not admin after bootstrap, no access
-    if (!currentRoles.includes("admin")) {
+    if (currentProfile.role !== "admin") {
       setLoading(false);
-      return;
+      return; // will render "Not authorized"
     }
 
     const rowsNormalized: ProfileRow[] = profiles.map((p) => ({
       id: p.id,
-      roles: parseRoles(p.role),
+      role: p.role,
       display_name: p.display_name || p.id,
       is_active: p.is_active ?? true,
     }));
@@ -157,21 +136,8 @@ export default function AdminUsersPage() {
     setLoading(false);
   };
 
-  const toggleRole = (id: string, role: string) => {
-    setRows((prev) =>
-      prev.map((r) => {
-        if (r.id !== id) return r;
-        let nextRoles = [...r.roles];
-        if (nextRoles.includes(role)) {
-          nextRoles = nextRoles.filter((rr) => rr !== role);
-        } else {
-          nextRoles.push(role);
-        }
-        // Always keep requester if user has no roles
-        if (nextRoles.length === 0) nextRoles = ["requester"];
-        return { ...r, roles: nextRoles };
-      })
-    );
+  const handleRoleChange = (id: string, role: string) => {
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, role } : r)));
   };
 
   const handleNameChange = (id: string, name: string) => {
@@ -182,6 +148,8 @@ export default function AdminUsersPage() {
 
   const handleToggleActive = async (row: ProfileRow) => {
     if (!authProfile) return;
+
+    // 🚫 Prevent admin from disabling their own account
     if (row.id === authProfile.id && row.is_active) {
       setErrorMsg("You cannot disable your own admin account.");
       return;
@@ -214,8 +182,8 @@ export default function AdminUsersPage() {
     setSaveStatus("saving");
     setErrorMsg(null);
 
-    // Ensure unique display_name
-    const seen = new Map<string, number>();
+    // 1) Check for duplicate display_name (case-insensitive)
+    const seen = new Map<string, number>(); // name -> count
     const dups = new Set<string>();
 
     for (const row of rows) {
@@ -223,7 +191,9 @@ export default function AdminUsersPage() {
       if (!name) continue;
       const count = (seen.get(name) || 0) + 1;
       seen.set(name, count);
-      if (count > 1) dups.add(name);
+      if (count > 1) {
+        dups.add(name);
+      }
     }
 
     if (dups.size > 0) {
@@ -237,12 +207,13 @@ export default function AdminUsersPage() {
       return;
     }
 
+    // 2) Save to Supabase
     try {
       for (const row of rows) {
         await supabase
           .from("profiles")
           .update({
-            role: stringifyRoles(row.roles),
+            role: row.role,
             display_name: row.display_name,
             is_active: row.is_active,
           })
@@ -253,6 +224,7 @@ export default function AdminUsersPage() {
       console.error(err);
       setErrorMsg("Error saving changes.");
       setSaveStatus("idle");
+      return;
     }
   };
 
@@ -272,7 +244,7 @@ export default function AdminUsersPage() {
     );
   }
 
-  if (!authProfile.roles.includes("admin")) {
+  if (authProfile.role !== "admin") {
     return (
       <div className="min-h-screen bg-slate-50">
         <header className="bg-white border-b border-slate-200">
@@ -339,13 +311,11 @@ export default function AdminUsersPage() {
         <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
           <div className="flex items-center justify-between gap-3 flex-wrap">
             <div className="text-sm text-slate-700">
-              <p className="font-semibold mb-1">
-                Manage users for stokstak
-              </p>
+              <p className="font-semibold mb-1">Manage users for stokstak</p>
               <p className="text-xs text-slate-500">
-                Users sign up via the login page. Admins can then assign
-                multiple roles like requester, purchaser, receiver, etc.  
-                Display names must be unique.
+                Users sign up via the login page. Admins can then set their
+                role, name, and disable or re-enable access here. Display names
+                must be unique to avoid confusion.
               </p>
             </div>
 
@@ -370,7 +340,7 @@ export default function AdminUsersPage() {
                 <tr className="text-xs text-slate-500 text-left">
                   <th className="px-3 py-2">User (name / email)</th>
                   <th className="px-3 py-2">User ID</th>
-                  <th className="px-3 py-2">Roles</th>
+                  <th className="px-3 py-2">Role</th>
                   <th className="px-3 py-2 text-right">Status</th>
                 </tr>
               </thead>
@@ -407,34 +377,24 @@ export default function AdminUsersPage() {
                         </p>
                       </td>
                       <td className="px-3 py-2 align-top">
-                        <div className="flex flex-wrap gap-1">
-                          {ALL_ROLES.map((role) => {
-                            const checked = row.roles.includes(role);
-                            return (
-                              <label
-                                key={role}
-                                className={`flex items-center gap-1 px-2 py-1 rounded-full text-[11px] border cursor-pointer ${
-                                  checked
-                                    ? "bg-emerald-50 border-emerald-300 text-emerald-700"
-                                    : "bg-white border-slate-200 text-slate-500"
-                                } ${
-                                  inactive
-                                    ? "opacity-60 cursor-not-allowed"
-                                    : ""
-                                }`}
-                              >
-                                <input
-                                  type="checkbox"
-                                  className="hidden"
-                                  checked={checked}
-                                  disabled={inactive}
-                                  onChange={() => toggleRole(row.id, role)}
-                                />
-                                <span>{role}</span>
-                              </label>
-                            );
-                          })}
-                        </div>
+                        <select
+                          value={row.role}
+                          onChange={(e) =>
+                            handleRoleChange(row.id, e.target.value)
+                          }
+                          className={`px-2 py-1 border rounded-lg text-xs ${
+                            inactive
+                              ? "bg-slate-100 text-slate-400"
+                              : "bg-white"
+                          }`}
+                          disabled={inactive}
+                        >
+                          {ROLE_OPTIONS.map((role) => (
+                            <option key={role} value={role}>
+                              {role}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td className="px-3 py-2 align-top text-right">
                         <button
@@ -477,8 +437,8 @@ export default function AdminUsersPage() {
             🔑 <strong>Create users:</strong> they sign up on the login page
             (email/password). A profile is created automatically on first
             login. Admin then assigns roles here.  
-            ❌ <strong>Hard delete:</strong> removing auth accounts requires
-            a secure backend; use “Disable” instead.
+            ❌ <strong>Hard delete:</strong> removing auth accounts requires a
+            secure backend; use “Disable” instead.
           </p>
         </div>
       </main>
