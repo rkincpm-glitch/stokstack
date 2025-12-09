@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useState, FormEvent } from "react";
+import { useEffect, useState } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
-import { ArrowLeft, Save, FileImage, Loader2 } from "lucide-react";
+import { ArrowLeft, Save, Trash2, AlertCircle, Loader2 } from "lucide-react";
 
 type Item = {
   id: string;
@@ -15,130 +15,144 @@ type Item = {
   quantity: number;
   image_url: string | null;
   image_url_2: string | null;
+  user_id: string | null;
   te_number: string | null;
-  purchase_price: number | null;
-  purchase_date: string | null;
+  purchase_price?: number | null;
+  purchase_date?: string | null;
+};
+
+type Profile = {
+  id: string;
+  role: string;
+  display_name: string | null;
 };
 
 export default function EditItemPage() {
   const router = useRouter();
   const params = useParams();
-  const id = params?.id as string;
+  const itemId = params?.id as string;
 
+  const [item, setItem] = useState<Item | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState<string | null>(null);
-  const [category, setCategory] = useState<string | null>(null);
-  const [location, setLocation] = useState<string | null>(null);
-  const [quantity, setQuantity] = useState<number>(0);
-  const [teNumber, setTeNumber] = useState<string | null>(null);
-  const [purchasePrice, setPurchasePrice] = useState<number | null>(null);
-  const [purchaseDate, setPurchaseDate] = useState<string | null>(null);
-  const [imageUrl, setImageUrl] = useState<string | null>(null);
-  const [imageUrl2, setImageUrl2] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    loadItem();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+    const init = async () => {
+      setLoading(true);
+      setErrorMsg(null);
 
-  const loadItem = async () => {
-    setLoading(true);
-    setErrorMsg(null);
+      const { data: userData } = await supabase.auth.getUser();
+      if (!userData?.user) {
+        router.push("/auth");
+        return;
+      }
 
-    // ❗ DO NOT filter by user_id here – only by id
-    const { data, error } = await supabase
-      .from("items")
-      .select("*")
-      .eq("id", id)
-      .single();
+      const userId = userData.user.id;
 
-    if (error || !data) {
-      console.error(error);
-      setErrorMsg("Item could not be found.");
+      // Load profile
+      const { data: prof } = await supabase
+        .from("profiles")
+        .select("id, role, display_name")
+        .eq("id", userId)
+        .maybeSingle();
+
+      if (prof) {
+        setProfile({
+          id: prof.id,
+          role: prof.role || "requester",
+          display_name: prof.display_name || null,
+        });
+      }
+
+      // Load item
+      const { data: itemData, error: itemError } = await supabase
+        .from("items")
+        .select("*")
+        .eq("id", itemId)
+        .maybeSingle();
+
+      if (itemError || !itemData) {
+        console.error(itemError);
+        setErrorMsg("Item could not be found.");
+        setItem(null);
+        setLoading(false);
+        return;
+      }
+
+      setItem(itemData as Item);
       setLoading(false);
-      return;
+    };
+
+    if (itemId) {
+      init();
     }
+  }, [itemId, router]);
 
-    const item = data as Item;
-    setName(item.name);
-    setDescription(item.description);
-    setCategory(item.category);
-    setLocation(item.location);
-    setQuantity(item.quantity);
-    setTeNumber(item.te_number);
-    setPurchasePrice(item.purchase_price);
-    setPurchaseDate(item.purchase_date);
-    setImageUrl(item.image_url);
-    setImageUrl2(item.image_url_2);
-
-    setLoading(false);
+  const handleChange = (field: keyof Item, value: any) => {
+    if (!item) return;
+    setItem({ ...item, [field]: value });
   };
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
+  const handleSave = async () => {
+    if (!item) return;
+
     setSaving(true);
     setErrorMsg(null);
+    setInfoMsg(null);
 
     const { error } = await supabase
       .from("items")
       .update({
-        name,
-        description,
-        category,
-        location,
-        quantity,
-        te_number: teNumber,
-        purchase_price: purchasePrice,
-        purchase_date: purchaseDate,
-        image_url: imageUrl,
-        image_url_2: imageUrl2,
+        name: item.name,
+        description: item.description,
+        category: item.category,
+        location: item.location,
+        quantity: item.quantity,
+        te_number: item.te_number,
+        image_url: item.image_url,
+        image_url_2: item.image_url_2,
+        purchase_price: item.purchase_price,
+        purchase_date: item.purchase_date,
       })
-      .eq("id", id);
+      .eq("id", item.id);
 
     if (error) {
       console.error(error);
-      setErrorMsg("Error updating item.");
-      setSaving(false);
-      return;
+      setErrorMsg("Error saving item.");
+    } else {
+      setInfoMsg("Item updated.");
     }
 
     setSaving(false);
-    router.push("/");
   };
 
-  const handleImageUpload = async (
-    file: File,
-    which: "image_url" | "image_url_2"
-  ) => {
-    const fileExt = file.name.split(".").pop();
-    const filePath = `${id}-${which}-${Date.now()}.${fileExt}`;
+  const handleDelete = async () => {
+    if (!item || !profile) return;
 
-    const { data, error } = await supabase.storage
-      .from("item-images")
-      .upload(filePath, file, {
-        cacheControl: "3600",
-        upsert: false,
-      });
+    const confirmed = window.confirm(
+      `Are you sure you want to permanently delete "${item.name}" from Stokstak? This cannot be undone.`
+    );
+    if (!confirmed) return;
+
+    setDeleting(true);
+    setErrorMsg(null);
+    setInfoMsg(null);
+
+    const { error } = await supabase.from("items").delete().eq("id", item.id);
 
     if (error) {
       console.error(error);
-      alert("Error uploading image");
+      setErrorMsg("Error deleting item.");
+      setDeleting(false);
       return;
     }
 
-    const { data: publicUrlData } = supabase.storage
-      .from("item-images")
-      .getPublicUrl(data.path);
-
-    if (which === "image_url") {
-      setImageUrl(publicUrlData.publicUrl);
-    } else {
-      setImageUrl2(publicUrlData.publicUrl);
-    }
+    // Optionally: also clean up related stock_verifications, links, etc.
+    router.push("/");
   };
 
   if (loading) {
@@ -149,24 +163,21 @@ export default function EditItemPage() {
     );
   }
 
-  if (errorMsg) {
+  if (!item) {
     return (
-      <div className="min-h-screen bg-slate-50">
-        <main className="max-w-xl mx-auto px-4 py-10">
-          <Link
-            href="/"
-            className="inline-flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900 mb-4"
-          >
-            <ArrowLeft className="w-4 h-4" />
-            Back to dashboard
-          </Link>
-          <div className="bg-white rounded-2xl shadow-sm border p-6">
-            <p className="text-sm text-red-600">{errorMsg}</p>
-          </div>
-        </main>
+      <div className="min-h-screen flex flex-col items-center justify-center text-slate-600">
+        <p className="mb-4">Item could not be found.</p>
+        <button
+          onClick={() => router.push("/")}
+          className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
+        >
+          Back to Stokstak
+        </button>
       </div>
     );
   }
+
+  const isAdmin = profile?.role === "admin";
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -180,217 +191,193 @@ export default function EditItemPage() {
             Back to dashboard
           </Link>
           <div className="flex items-center gap-2">
-            <div className="bg-blue-600 p-2 rounded-lg">
-              <FileImage className="w-5 h-5 text-white" />
-            </div>
-            <span className="text-sm font-semibold text-slate-900">
-              Edit Item
-            </span>
+            <p className="text-sm font-semibold text-slate-900">
+              Edit Item – {item.name}
+            </p>
           </div>
         </div>
       </header>
 
-      <main className="max-w-3xl mx-auto px-4 py-6">
-        <form
-          onSubmit={handleSubmit}
-          className="bg-white rounded-2xl shadow-sm border p-6 space-y-4"
-        >
-          {errorMsg && (
-            <p className="text-sm text-red-600">{errorMsg}</p>
-          )}
-
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-slate-600">
-              Name
-            </label>
-            <input
-              className="w-full border rounded-lg px-3 py-2 text-sm"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              required
-            />
+      <main className="max-w-3xl mx-auto px-4 py-6 space-y-4">
+        {errorMsg && (
+          <div className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <AlertCircle className="w-4 h-4" />
+            <span>{errorMsg}</span>
           </div>
-
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-slate-600">
-              Description
-            </label>
-            <textarea
-              className="w-full border rounded-lg px-3 py-2 text-sm"
-              value={description || ""}
-              onChange={(e) =>
-                setDescription(e.target.value || null)
-              }
-              rows={3}
-            />
+        )}
+        {infoMsg && (
+          <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+            <AlertCircle className="w-4 h-4" />
+            <span>{infoMsg}</span>
           </div>
+        )}
 
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
+        <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
+          {/* Basic fields */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Name
+              </label>
+              <input
+                type="text"
+                value={item.name}
+                onChange={(e) => handleChange("name", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                TE Number
+              </label>
+              <input
+                type="text"
+                value={item.te_number || ""}
+                onChange={(e) => handleChange("te_number", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
                 Category
               </label>
               <input
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={category || ""}
-                onChange={(e) =>
-                  setCategory(e.target.value || null)
-                }
+                type="text"
+                value={item.category || ""}
+                onChange={(e) => handleChange("category", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
                 Location
               </label>
               <input
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={location || ""}
-                onChange={(e) =>
-                  setLocation(e.target.value || null)
-                }
+                type="text"
+                value={item.location || ""}
+                onChange={(e) => handleChange("location", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
                 Quantity
               </label>
               <input
                 type="number"
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={quantity}
+                value={item.quantity}
                 onChange={(e) =>
-                  setQuantity(Number(e.target.value || 0))
+                  handleChange("quantity", Number(e.target.value || 0))
                 }
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
-                TE Number
-              </label>
-              <input
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={teNumber || ""}
-                onChange={(e) =>
-                  setTeNumber(e.target.value || null)
-                }
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
-                Purchase Price
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Unit Price
               </label>
               <input
                 type="number"
                 step="0.01"
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={purchasePrice ?? ""}
+                value={item.purchase_price ?? ""}
                 onChange={(e) =>
-                  setPurchasePrice(
-                    e.target.value === ""
-                      ? null
-                      : Number(e.target.value)
+                  handleChange(
+                    "purchase_price",
+                    e.target.value === "" ? null : Number(e.target.value)
                   )
                 }
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-slate-600">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
                 Purchase Date
               </label>
               <input
                 type="date"
-                className="w-full border rounded-lg px-3 py-2 text-sm"
-                value={purchaseDate || ""}
+                value={item.purchase_date || ""}
                 onChange={(e) =>
-                  setPurchaseDate(e.target.value || null)
+                  handleChange(
+                    "purchase_date",
+                    e.target.value === "" ? null : e.target.value
+                  )
                 }
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
           </div>
 
-          {/* Images */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Primary */}
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-slate-600">
-                Primary photo
-              </p>
-              <div className="aspect-square border rounded-xl flex items-center justify-center overflow-hidden bg-slate-50">
-                {imageUrl ? (
-                  <img
-                    src={imageUrl}
-                    alt={name}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <FileImage className="w-10 h-10 text-slate-300" />
-                )}
-              </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600 mb-1">
+              Description
+            </label>
+            <textarea
+              value={item.description || ""}
+              onChange={(e) => handleChange("description", e.target.value)}
+              rows={3}
+              className="w-full px-3 py-2 border rounded-lg text-sm"
+            />
+          </div>
+
+          {/* Image URLs - keep simple text fields */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Primary Image URL
+              </label>
               <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => {
-                  if (e.target.files?.[0]) {
-                    handleImageUpload(e.target.files[0], "image_url");
-                  }
-                }}
-                className="text-xs"
+                type="text"
+                value={item.image_url || ""}
+                onChange={(e) => handleChange("image_url", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
-
-            {/* Secondary */}
-            <div className="space-y-2">
-              <p className="text-xs font-medium text-slate-600">
-                Secondary photo
-              </p>
-              <div className="aspect-square border rounded-xl flex items-center justify-center overflow-hidden bg-slate-50">
-                {imageUrl2 ? (
-                  <img
-                    src={imageUrl2}
-                    alt={`${name} 2`}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <FileImage className="w-10 h-10 text-slate-300" />
-                )}
-              </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-600 mb-1">
+                Secondary Image URL
+              </label>
               <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => {
-                  if (e.target.files?.[0]) {
-                    handleImageUpload(e.target.files[0], "image_url_2");
-                  }
-                }}
-                className="text-xs"
+                type="text"
+                value={item.image_url_2 || ""}
+                onChange={(e) => handleChange("image_url_2", e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
           </div>
 
-          <button
-            type="submit"
-            disabled={saving}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-60"
-          >
-            {saving ? (
-              <>
+          {/* Actions */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t">
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving || deleting}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+            >
+              {saving ? (
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
+              ) : (
                 <Save className="w-4 h-4" />
-                Save item
-              </>
+              )}
+              {saving ? "Saving..." : "Save changes"}
+            </button>
+
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={handleDelete}
+                disabled={deleting}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-60"
+              >
+                {deleting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Trash2 className="w-4 h-4" />
+                )}
+                {deleting ? "Deleting..." : "Delete item"}
+              </button>
             )}
-          </button>
-        </form>
+          </div>
+        </div>
       </main>
     </div>
   );
