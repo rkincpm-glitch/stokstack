@@ -27,6 +27,13 @@ type Profile = {
   is_active: boolean;
 };
 
+type ApplicationLocationRow = {
+  id: string;
+  name: string;
+};
+
+type ItemType = "tools" | "materials" | "";
+
 type LineItem = {
   id: string;
   description: string;
@@ -34,6 +41,7 @@ type LineItem = {
   unit: string;
   application_location: string;
   est_unit_price: number | "";
+  item_type: ItemType;
 };
 
 export default function NewPurchaseRequestPage() {
@@ -44,6 +52,7 @@ export default function NewPurchaseRequestPage() {
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [appLocations, setAppLocations] = useState<ApplicationLocationRow[]>([]);
 
   const [projectId, setProjectId] = useState<string>("");
   const [neededBy, setNeededBy] = useState<string>("");
@@ -57,6 +66,7 @@ export default function NewPurchaseRequestPage() {
       unit: "ea",
       application_location: "",
       est_unit_price: "",
+      item_type: "",
     },
   ]);
 
@@ -79,9 +89,9 @@ export default function NewPurchaseRequestPage() {
       return;
     }
     const userId = userData.user.id;
+    const email = userData.user.email || "";
 
     // Load or create profile
-    const email = userData.user.email || "";
     let { data: prof, error: profError } = await supabase
       .from("profiles")
       .select("id, role, display_name, is_active")
@@ -132,7 +142,6 @@ export default function NewPurchaseRequestPage() {
       display_name: prof.display_name || email,
       is_active: prof.is_active ?? true,
     };
-
     setProfile(myProfile);
 
     // Load projects
@@ -151,6 +160,20 @@ export default function NewPurchaseRequestPage() {
     }
 
     setProjects((projData || []) as Project[]);
+
+    // Load application locations for dropdown suggestions
+    const { data: appLocData, error: appLocError } = await supabase
+      .from("application_locations")
+      .select("id, name")
+      .order("name", { ascending: true });
+
+    if (appLocError) {
+      console.error("Error loading application locations:", appLocError);
+      // Not fatal; we just skip suggestions
+    } else {
+      setAppLocations((appLocData || []) as ApplicationLocationRow[]);
+    }
+
     setLoading(false);
   };
 
@@ -164,6 +187,7 @@ export default function NewPurchaseRequestPage() {
         unit: "ea",
         application_location: "",
         est_unit_price: "",
+        item_type: "",
       },
     ]);
   };
@@ -253,6 +277,7 @@ export default function NewPurchaseRequestPage() {
           est_unit_price:
             it.est_unit_price === "" ? null : Number(it.est_unit_price),
           status: "pending",
+          item_type: it.item_type || null, // requires column "item_type" in purchase_request_items
         }));
 
       if (payloadItems.length > 0) {
@@ -289,6 +314,12 @@ export default function NewPurchaseRequestPage() {
       setSaving(false);
     }
   };
+
+  const estTotal = items.reduce((sum, it) => {
+    const qty = Number(it.quantity || 0);
+    const price = Number(it.est_unit_price || 0);
+    return sum + qty * price;
+  }, 0);
 
   if (loading) {
     return (
@@ -463,7 +494,7 @@ export default function NewPurchaseRequestPage() {
                           })
                         }
                         className="w-full px-3 py-2 border rounded-lg text-sm"
-                        placeholder="e.g. 2\" rigid conduit, cordless hammer drill, safety harness..."
+                        placeholder={'e.g. 2" rigid conduit, cordless hammer drill, safety harness...'}
                       />
                     </div>
 
@@ -507,8 +538,9 @@ export default function NewPurchaseRequestPage() {
                     </div>
                   </div>
 
-                  {/* Location & price */}
+                  {/* Location, type & price */}
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {/* Application location with suggestions */}
                     <div className="md:col-span-2">
                       <label className="block text-[11px] font-medium text-slate-600 mb-1">
                         Application location (optional)
@@ -521,29 +553,52 @@ export default function NewPurchaseRequestPage() {
                             application_location: e.target.value,
                           })
                         }
+                        list="app-location-options"
                         className="w-full px-3 py-2 border rounded-lg text-sm"
                         placeholder="e.g. MER Level 02, North Tube, Roof Area A..."
                       />
                     </div>
-                    <div>
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Est. unit price (optional)
-                      </label>
-                      <input
-                        type="number"
-                        min={0}
-                        value={it.est_unit_price}
-                        onChange={(e) =>
-                          updateItem(it.id, {
-                            est_unit_price:
-                              e.target.value === ""
-                                ? ""
-                                : Number(e.target.value),
-                          })
-                        }
-                        className="w-full px-3 py-2 border rounded-lg text-sm"
-                        placeholder="0.00"
-                      />
+
+                    {/* Item type + price */}
+                    <div className="grid grid-cols-1 gap-2">
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                          Type
+                        </label>
+                        <select
+                          value={it.item_type}
+                          onChange={(e) =>
+                            updateItem(it.id, {
+                              item_type: e.target.value as ItemType,
+                            })
+                          }
+                          className="w-full px-3 py-2 border rounded-lg text-sm"
+                        >
+                          <option value="">Select type...</option>
+                          <option value="tools">Tools &amp; Eqpt</option>
+                          <option value="materials">Site Materials</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                          Est. unit price (optional)
+                        </label>
+                        <input
+                          type="number"
+                          min={0}
+                          value={it.est_unit_price}
+                          onChange={(e) =>
+                            updateItem(it.id, {
+                              est_unit_price:
+                                e.target.value === ""
+                                  ? ""
+                                  : Number(e.target.value),
+                            })
+                          }
+                          className="w-full px-3 py-2 border rounded-lg text-sm"
+                          placeholder="0.00"
+                        />
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -551,7 +606,22 @@ export default function NewPurchaseRequestPage() {
             </div>
           )}
 
-          <div className="flex justify-end pt-3 border-t mt-2">
+          {/* datalist for application locations suggestions */}
+          <datalist id="app-location-options">
+            {appLocations.map((loc) => (
+              <option key={loc.id} value={loc.name} />
+            ))}
+          </datalist>
+
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between pt-3 border-t mt-2 gap-3">
+            <p className="text-xs text-slate-500">
+              Estimated total:{" "}
+              <span className="font-semibold text-slate-900">
+                ${estTotal.toFixed(2)}
+              </span>
+              {estTotal === 0 && " (add unit prices to see a total)"}
+            </p>
+
             <button
               type="button"
               onClick={handleSubmit}
