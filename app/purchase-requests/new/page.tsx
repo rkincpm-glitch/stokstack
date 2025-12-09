@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, FormEvent } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -8,10 +8,10 @@ import {
   ArrowLeft,
   ClipboardList,
   Calendar,
-  MapPin,
   Plus,
   Trash2,
-  Package,
+  AlertCircle,
+  Save,
 } from "lucide-react";
 
 type Project = {
@@ -20,221 +20,271 @@ type Project = {
   code: string | null;
 };
 
-type LineItemForm = {
+type Profile = {
+  id: string;
+  role: string;
+  display_name: string | null;
+  is_active: boolean;
+};
+
+type LineItem = {
+  id: string;
   description: string;
   quantity: number | "";
   unit: string;
-  applicationLocation: string;
-  estUnitPrice: number | "";
+  application_location: string;
+  est_unit_price: number | "";
 };
-
-const ADD_PROJECT_VALUE = "__ADD_NEW_PROJECT__";
 
 export default function NewPurchaseRequestPage() {
   const router = useRouter();
 
-  const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  const [profile, setProfile] = useState<Profile | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState("");
 
-  const [neededBy, setNeededBy] = useState("");
-  const [notes, setNotes] = useState("");
+  const [projectId, setProjectId] = useState<string>("");
+  const [neededBy, setNeededBy] = useState<string>("");
+  const [notes, setNotes] = useState<string>("");
 
-  const [items, setItems] = useState<LineItemForm[]>([
-    { description: "", quantity: "", unit: "ea", applicationLocation: "", estUnitPrice: "" },
+  const [items, setItems] = useState<LineItem[]>([
+    {
+      id: crypto.randomUUID(),
+      description: "",
+      quantity: "",
+      unit: "ea",
+      application_location: "",
+      est_unit_price: "",
+    },
   ]);
 
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
+
   useEffect(() => {
-    const init = async () => {
-      const { data: userData } = await supabase.auth.getUser();
-      if (!userData?.user) {
-        router.push("/auth");
+    init();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const init = async () => {
+    setLoading(true);
+    setErrorMsg(null);
+    setInfoMsg(null);
+
+    const { data: userData } = await supabase.auth.getUser();
+    if (!userData?.user) {
+      router.push("/auth");
+      return;
+    }
+    const userId = userData.user.id;
+
+    // Load or create profile
+    const email = userData.user.email || "";
+    let { data: prof, error: profError } = await supabase
+      .from("profiles")
+      .select("id, role, display_name, is_active")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (!prof && !profError) {
+      const { data: newProf, error: newProfError } = await supabase
+        .from("profiles")
+        .insert({
+          id: userId,
+          role: "requester",
+          display_name: email,
+          is_active: true,
+        })
+        .select("id, role, display_name, is_active")
+        .single();
+
+      if (newProfError) {
+        console.error("Error creating profile:", newProfError);
+        setErrorMsg(
+          `Could not create profile: ${newProfError.message}. Check Supabase "profiles" table.`
+        );
+        setLoading(false);
         return;
       }
-      const uid = userData.user.id;
-      setUserId(uid);
 
-      await loadProjects(uid);
-      setNeededBy(new Date().toISOString().slice(0, 10));
+      prof = newProf;
+    }
+
+    if (!prof) {
+      setErrorMsg("Could not load your profile.");
       setLoading(false);
+      return;
+    }
+
+    if (prof.is_active === false) {
+      setErrorMsg(
+        "Your account has been disabled. Contact your admin to re-enable access."
+      );
+      setLoading(false);
+      return;
+    }
+
+    const myProfile: Profile = {
+      id: prof.id,
+      role: prof.role || "requester",
+      display_name: prof.display_name || email,
+      is_active: prof.is_active ?? true,
     };
 
-    init();
-  }, [router]);
+    setProfile(myProfile);
 
-  const loadProjects = async (uid: string) => {
-    const { data, error } = await supabase
+    // Load projects
+    const { data: projData, error: projError } = await supabase
       .from("projects")
       .select("id, name, code")
-      .eq("user_id", uid)
-      .order("created_at", { ascending: true });
+      .order("name", { ascending: true });
 
-    if (error) {
-      console.error("Error loading projects:", error);
+    if (projError) {
+      console.error("Error loading projects:", projError);
+      setErrorMsg(
+        `Error loading projects: ${projError.message}. Ensure "projects" table exists and RLS allows select.`
+      );
+      setLoading(false);
       return;
     }
 
-    setProjects((data || []) as Project[]);
+    setProjects((projData || []) as Project[]);
+    setLoading(false);
   };
 
-  const handleProjectChange = async (value: string) => {
-    if (!userId) return;
-
-    if (value !== ADD_PROJECT_VALUE) {
-      setProjectId(value);
-      return;
-    }
-
-    const name = window.prompt("Enter new project name:");
-    if (!name || !name.trim()) return;
-
-    const codeInput = window.prompt("Enter project code (optional):");
-    const code = codeInput && codeInput.trim() ? codeInput.trim() : null;
-
-    const { data, error } = await supabase
-      .from("projects")
-      .insert({
-        user_id: userId,
-        name: name.trim(),
-        code,
-      })
-      .select()
-      .single();
-
-    if (error || !data) {
-      console.error("Error creating project:", error);
-      setErrorMsg("Could not create project.");
-      return;
-    }
-
-    const newProject = data as Project;
-    setProjects((prev) => [...prev, newProject]);
-    setProjectId(newProject.id);
-  };
-
-  const handleItemChange = (
-    index: number,
-    field: keyof LineItemForm,
-    value: string
-  ) => {
-    setItems((prev) =>
-      prev.map((row, i) =>
-        i === index
-          ? {
-              ...row,
-              [field]:
-                field === "quantity" || field === "estUnitPrice"
-                  ? value === ""
-                    ? ""
-                    : Number(value)
-                  : value,
-            }
-          : row
-      )
-    );
-  };
-
-  const addRow = () => {
+  const handleAddItem = () => {
     setItems((prev) => [
       ...prev,
       {
+        id: crypto.randomUUID(),
         description: "",
         quantity: "",
         unit: "ea",
-        applicationLocation: "",
-        estUnitPrice: "",
+        application_location: "",
+        est_unit_price: "",
       },
     ]);
   };
 
-  const removeRow = (index: number) => {
-    setItems((prev) => prev.filter((_, i) => i !== index));
+  const handleRemoveItem = (id: string) => {
+    setItems((prev) => prev.filter((it) => it.id !== id));
   };
 
-  const handleSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!userId) return;
+  const updateItem = (id: string, patch: Partial<LineItem>) => {
+    setItems((prev) =>
+      prev.map((it) => (it.id === id ? { ...it, ...patch } : it))
+    );
+  };
+
+  const validateForm = (): string | null => {
+    if (!projectId) {
+      return "Please select a project.";
+    }
+
+    const nonEmptyItems = items.filter(
+      (it) => it.description.trim() !== "" && Number(it.quantity || 0) > 0
+    );
+
+    if (nonEmptyItems.length === 0) {
+      return "Please add at least one line item with description and quantity.";
+    }
+
+    return null;
+  };
+
+  const handleSubmit = async () => {
+    if (!profile) return;
+
+    setErrorMsg(null);
+    setInfoMsg(null);
+
+    const validationError = validateForm();
+    if (validationError) {
+      setErrorMsg(validationError);
+      return;
+    }
 
     setSaving(true);
-    setErrorMsg(null);
-    setSuccessMsg(null);
 
     try {
-      if (!projectId) {
-        setErrorMsg("Project is required.");
-        setSaving(false);
-        return;
-      }
-
-      const validItems = items.filter(
-        (it) => it.description.trim() && it.quantity !== ""
-      );
-
-      if (validItems.length === 0) {
-        setErrorMsg("Add at least one line item with description and quantity.");
-        setSaving(false);
-        return;
-      }
-
-      // 1) Insert request header
-      const { data: reqData, error: reqError } = await supabase
+      // 1) Create purchase request (only columns we KNOW are safe)
+      const { data: req, error: reqError } = await supabase
         .from("purchase_requests")
         .insert({
-          project_id: projectId,
-          requested_by: userId,
+          project_id: projectId || null,
+          requested_by: profile.id,
           status: "submitted",
           needed_by: neededBy || null,
-          notes: notes.trim() || null,
+          notes: notes || null,
         })
-        .select()
+        .select("*")
         .single();
 
-      if (reqError || !reqData) {
-        console.error("Error creating request:", reqError);
-        setErrorMsg("Error creating purchase request.");
-        setSaving(false);
-        return;
-      }
-
-      const requestId = reqData.id as string;
-
-      // 2) Insert line items
-      const payload = validItems.map((it) => ({
-        request_id: requestId,
-        item_id: null,
-        description: it.description.trim(),
-        quantity: it.quantity === "" ? 0 : Number(it.quantity),
-        unit: it.unit || "ea",
-        application_location: it.applicationLocation.trim() || null,
-        est_unit_price:
-          it.estUnitPrice === "" ? null : Number(it.estUnitPrice),
-      }));
-
-      const { error: itemsError } = await supabase
-        .from("purchase_request_items")
-        .insert(payload);
-
-      if (itemsError) {
-        console.error("Error saving line items:", itemsError);
+      if (reqError || !req) {
+        console.error("Supabase insert error (purchase_requests):", reqError);
         setErrorMsg(
-          "Request header saved, but there was an error saving line items."
+          `Error creating purchase request: ${
+            reqError?.message || "Unknown error"
+          }`
         );
         setSaving(false);
         return;
       }
 
-      setSuccessMsg("Purchase request created.");
+      const requestId = req.id as string;
+
+      // 2) Insert line items
+      const payloadItems = items
+        .filter(
+          (it) => it.description.trim() !== "" && Number(it.quantity || 0) > 0
+        )
+        .map((it) => ({
+          request_id: requestId,
+          item_id: null, // link to inventory item later if needed
+          description: it.description.trim(),
+          quantity: Number(it.quantity || 0),
+          unit: it.unit || "ea",
+          application_location:
+            it.application_location.trim() === ""
+              ? null
+              : it.application_location.trim(),
+          est_unit_price:
+            it.est_unit_price === "" ? null : Number(it.est_unit_price),
+          status: "pending",
+        }));
+
+      if (payloadItems.length > 0) {
+        const { error: itemsError } = await supabase
+          .from("purchase_request_items")
+          .insert(payloadItems);
+
+        if (itemsError) {
+          console.error(
+            "Supabase insert error (purchase_request_items):",
+            itemsError
+          );
+          setErrorMsg(
+            `Request created but items failed: ${itemsError.message}. Check "purchase_request_items" columns and RLS.`
+          );
+          setSaving(false);
+          return;
+        }
+      }
+
+      setInfoMsg("Purchase request created and submitted for approval.");
+      // Short delay then go to detail page
       setTimeout(() => {
         router.push(`/purchase-requests/${requestId}`);
-      }, 600);
-    } catch (err) {
-      console.error(err);
-      setErrorMsg("Unexpected error. Please try again.");
+      }, 800);
+    } catch (err: any) {
+      console.error("Unexpected error creating purchase request:", err);
+      setErrorMsg(
+        `Unexpected error creating purchase request: ${
+          err?.message || String(err)
+        }`
+      );
     } finally {
       setSaving(false);
     }
@@ -244,6 +294,14 @@ export default function NewPurchaseRequestPage() {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading...
+      </div>
+    );
+  }
+
+  if (!profile) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-red-600">
+        Could not load profile. Please sign out and sign in again.
       </div>
     );
   }
@@ -270,235 +328,241 @@ export default function NewPurchaseRequestPage() {
                 New Purchase Request
               </p>
               <p className="text-xs text-slate-500">
-                Select project and add items to buy
+                Role: {profile.role || "requester"}
               </p>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Form */}
-      <main className="max-w-4xl mx-auto px-4 py-6">
-        <form
-          onSubmit={handleSubmit}
-          className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-6"
-        >
-          {errorMsg && (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-              {errorMsg}
-            </div>
-          )}
-          {successMsg && (
-            <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-              {successMsg}
-            </div>
-          )}
+      {/* Main */}
+      <main className="max-w-4xl mx-auto px-4 py-6 space-y-4">
+        {errorMsg && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4" />
+            <span>{errorMsg}</span>
+          </div>
+        )}
 
-          {/* Project & timing */}
-          <section className="space-y-4">
-            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
-              Project & Timing
-            </h2>
+        {infoMsg && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700 flex items-center gap-2">
+            <Save className="w-4 h-4" />
+            <span>{infoMsg}</span>
+          </div>
+        )}
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">
-                  Project<span className="text-red-500">*</span>
-                </label>
-                <select
-                  value={projectId}
-                  onChange={(e) => handleProjectChange(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-lg text-sm"
-                >
-                  <option value="">Select project</option>
-                  {projects.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                      {p.code ? ` (${p.code})` : ""}
-                    </option>
-                  ))}
-                  <option value={ADD_PROJECT_VALUE}>➕ Add new project…</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-600 mb-1">
-                  Needed by
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex items-center justify-center w-8 h-8 border rounded-lg text-slate-500 text-xs">
-                    <Calendar className="w-4 h-4" />
-                  </span>
-                  <input
-                    type="date"
-                    value={neededBy}
-                    onChange={(e) => setNeededBy(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-lg text-sm"
-                  />
-                </div>
-              </div>
-            </div>
-
+        {/* Request header card */}
+        <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Project */}
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Notes to approver / purchaser
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Project
               </label>
-              <textarea
-                value={notes}
-                onChange={(e) => setNotes(e.target.value)}
-                rows={3}
+              <select
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
-                placeholder="Any specific vendor, alternates, or instructions."
-              />
+              >
+                <option value="">Select project...</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                    {p.code ? ` (${p.code})` : ""}
+                  </option>
+                ))}
+              </select>
             </div>
-          </section>
 
-          {/* Line items */}
-          <section className="space-y-4">
+            {/* Needed by */}
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Needed by date
+              </label>
+              <div className="relative">
+                <Calendar className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  type="date"
+                  value={neededBy}
+                  onChange={(e) => setNeededBy(e.target.value)}
+                  className="w-full pl-9 pr-3 py-2 border rounded-lg text-sm"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Notes */}
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 mb-1">
+              Overall notes (optional)
+            </label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              rows={3}
+              className="w-full px-3 py-2 border rounded-lg text-sm resize-y"
+              placeholder="General notes for purchasing or jobsite (optional)..."
+            />
+          </div>
+        </section>
+
+        {/* Line items */}
+        <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
+          <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
               Line Items
             </h2>
+            <button
+              type="button"
+              onClick={handleAddItem}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-900 text-white hover:bg-slate-800"
+            >
+              <Plus className="w-3 h-3" />
+              Add item
+            </button>
+          </div>
 
+          {items.length === 0 ? (
+            <p className="text-xs text-slate-500">
+              No items yet. Click “Add item” to start.
+            </p>
+          ) : (
             <div className="space-y-3">
-              {items.map((row, index) => (
+              {items.map((it, idx) => (
                 <div
-                  key={index}
+                  key={it.id}
                   className="border rounded-xl p-3 bg-slate-50 space-y-2"
                 >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-xs font-semibold text-slate-600">
-                      <Package className="w-4 h-4" />
-                      Item {index + 1}
-                    </div>
-                    {items.length > 1 && (
-                      <button
-                        type="button"
-                        onClick={() => removeRow(index)}
-                        className="inline-flex items-center gap-1 text-xs text-red-600 hover:text-red-800"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                        Remove
-                      </button>
-                    )}
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-slate-600">
+                      Item {idx + 1}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveItem(it.id)}
+                      disabled={items.length === 1}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-red-700 hover:bg-red-50 disabled:opacity-40"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      Remove
+                    </button>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div className="sm:col-span-2">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {/* Description */}
+                    <div className="md:col-span-2">
                       <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Description<span className="text-red-500">*</span>
+                        Description
                       </label>
                       <input
                         type="text"
-                        value={row.description}
+                        value={it.description}
                         onChange={(e) =>
-                          handleItemChange(index, "description", e.target.value)
+                          updateItem(it.id, {
+                            description: e.target.value,
+                          })
                         }
-                        placeholder='e.g. 1-1/4" SDS+ drill bits, 12" long'
-                        className="w-full px-3 py-2 border rounded-lg text-xs"
+                        className="w-full px-3 py-2 border rounded-lg text-sm"
+                        placeholder="e.g. 2\" rigid conduit, cordless hammer drill, safety harness..."
                       />
                     </div>
 
-                    <div>
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Quantity<span className="text-red-500">*</span>
-                      </label>
-                      <div className="flex gap-2">
+                    {/* Quantity & unit */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                          Qty
+                        </label>
                         <input
                           type="number"
                           min={0}
-                          value={row.quantity}
+                          value={it.quantity}
                           onChange={(e) =>
-                            handleItemChange(index, "quantity", e.target.value)
+                            updateItem(it.id, {
+                              quantity:
+                                e.target.value === ""
+                                  ? ""
+                                  : Number(e.target.value),
+                            })
                           }
-                          className="w-full px-3 py-2 border rounded-lg text-xs"
+                          className="w-full px-3 py-2 border rounded-lg text-sm"
                         />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                          Unit
+                        </label>
                         <input
                           type="text"
-                          value={row.unit}
+                          value={it.unit}
                           onChange={(e) =>
-                            handleItemChange(index, "unit", e.target.value)
+                            updateItem(it.id, {
+                              unit: e.target.value,
+                            })
                           }
-                          className="w-20 px-2 py-2 border rounded-lg text-xs"
-                          placeholder="ea"
+                          className="w-full px-3 py-2 border rounded-lg text-sm"
+                          placeholder="ea, box, roll..."
                         />
                       </div>
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div>
+                  {/* Location & price */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    <div className="md:col-span-2">
                       <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Application Location
+                        Application location (optional)
                       </label>
-                      <div className="flex items-center gap-2">
-                        <MapPin className="w-3 h-3 text-slate-400" />
-                        <input
-                          type="text"
-                          value={row.applicationLocation}
-                          onChange={(e) =>
-                            handleItemChange(
-                              index,
-                              "applicationLocation",
-                              e.target.value
-                            )
-                          }
-                          placeholder="e.g. MER, North Tube, Gridline 11"
-                          className="w-full px-3 py-2 border rounded-lg text-xs"
-                        />
-                      </div>
+                      <input
+                        type="text"
+                        value={it.application_location}
+                        onChange={(e) =>
+                          updateItem(it.id, {
+                            application_location: e.target.value,
+                          })
+                        }
+                        className="w-full px-3 py-2 border rounded-lg text-sm"
+                        placeholder="e.g. MER Level 02, North Tube, Roof Area A..."
+                      />
                     </div>
-
                     <div>
                       <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Est. Unit Price (optional)
+                        Est. unit price (optional)
                       </label>
                       <input
                         type="number"
                         min={0}
-                        step="0.01"
-                        value={row.estUnitPrice}
+                        value={it.est_unit_price}
                         onChange={(e) =>
-                          handleItemChange(
-                            index,
-                            "estUnitPrice",
-                            e.target.value
-                          )
+                          updateItem(it.id, {
+                            est_unit_price:
+                              e.target.value === ""
+                                ? ""
+                                : Number(e.target.value),
+                          })
                         }
-                        className="w-full px-3 py-2 border rounded-lg text-xs"
+                        className="w-full px-3 py-2 border rounded-lg text-sm"
+                        placeholder="0.00"
                       />
                     </div>
                   </div>
                 </div>
               ))}
             </div>
+          )}
 
+          <div className="flex justify-end pt-3 border-t mt-2">
             <button
               type="button"
-              onClick={addRow}
-              className="inline-flex items-center gap-2 text-xs font-medium text-emerald-700 hover:text-emerald-900"
-            >
-              <Plus className="w-4 h-4" />
-              Add line
-            </button>
-          </section>
-
-          {/* Actions */}
-          <div className="flex items-center justify-between pt-4 border-t mt-4">
-            <Link
-              href="/purchase-requests"
-              className="text-sm text-slate-500 hover:text-slate-900"
-            >
-              Cancel
-            </Link>
-            <button
-              type="submit"
+              onClick={handleSubmit}
               disabled={saving}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60"
             >
-              {saving ? "Submitting..." : "Submit Request"}
+              <Save className="w-4 h-4" />
+              {saving ? "Submitting..." : "Submit request"}
             </button>
           </div>
-        </form>
+        </section>
       </main>
     </div>
   );
