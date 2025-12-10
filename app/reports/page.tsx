@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -15,12 +15,14 @@ import {
   FileImage,
   X,
   CheckCircle2,
+  Upload,
 } from "lucide-react";
 
 type Item = {
   id: string;
   name: string;
   description: string | null;
+  type?: string | null;
   category: string | null;
   location: string | null;
   quantity: number;
@@ -43,18 +45,19 @@ type LastVerification = {
   item_id: string;
   verified_at: string; // ISO date
   verified_qty: number;
+  photo_url?: string | null;
 };
 
 export default function ReportsPage() {
   const router = useRouter();
 
+  const [userId, setUserId] = useState<string | null>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [groups, setGroups] = useState<CategoryGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
 
-  // last verification info per item_id
   const [lastVerifications, setLastVerifications] = useState<
     Record<string, LastVerification>
   >({});
@@ -62,14 +65,16 @@ export default function ReportsPage() {
   // filters
   const [filterCategory, setFilterCategory] = useState<string>("all");
   const [filterLocation, setFilterLocation] = useState<string>("all");
+  const [filterType, setFilterType] = useState<string>("all");
   const [search, setSearch] = useState<string>("");
 
-  // state for adding a new verification from modal
+  // add verification form
   const [verDate, setVerDate] = useState<string>(
     new Date().toISOString().slice(0, 10)
   );
   const [verQty, setVerQty] = useState<number | "">("");
   const [verNotes, setVerNotes] = useState<string>("");
+  const [verPhotoUrl, setVerPhotoUrl] = useState<string | null>(null);
   const [savingVerification, setSavingVerification] = useState(false);
   const [verificationError, setVerificationError] = useState<string | null>(
     null
@@ -93,9 +98,9 @@ export default function ReportsPage() {
       router.push("/auth");
       return;
     }
+    setUserId(userData.user.id);
 
     try {
-      // items
       const { data: itemsData, error: itemsError } = await supabase
         .from("items")
         .select("*")
@@ -114,33 +119,30 @@ export default function ReportsPage() {
       const allItems = (itemsData || []) as Item[];
       setItems(allItems);
 
-      // stock verifications (all for now; you can filter by user or project later)
       const { data: verData, error: verError } = await supabase
         .from("stock_verifications")
-        .select("item_id, verified_at, verified_qty")
+        .select("item_id, verified_at, verified_qty, photo_url")
         .order("verified_at", { ascending: false });
 
       if (verError) {
         console.error("Error loading stock verifications:", verError);
       } else {
-        // build map of last verification per item
         const map: Record<string, LastVerification> = {};
         for (const row of verData || []) {
-          const itemId = row.item_id;
+          const itemId = row.item_id as string;
           if (!map[itemId]) {
             map[itemId] = {
               item_id: itemId,
-              verified_at: row.verified_at,
-              verified_qty: row.verified_qty,
+              verified_at: row.verified_at as string,
+              verified_qty: row.verified_qty as number,
+              photo_url: (row as any).photo_url ?? null,
             };
           }
         }
         setLastVerifications(map);
       }
 
-      // initial grouping (unfiltered - filters apply via memo below)
       const groupMap = new Map<string, CategoryGroup>();
-
       for (const it of allItems) {
         const key = it.category || "Uncategorized";
         if (!groupMap.has(key)) {
@@ -170,7 +172,7 @@ export default function ReportsPage() {
     }
   };
 
-  // derive filter options
+  // options
   const categoryOptions = useMemo(() => {
     const set = new Set<string>();
     items.forEach((i) => set.add(i.category || "Uncategorized"));
@@ -183,7 +185,12 @@ export default function ReportsPage() {
     return Array.from(set).sort();
   }, [items]);
 
-  // filtered / searched grouping
+  const typeOptions = useMemo(() => {
+    const set = new Set<string>();
+    items.forEach((i) => set.add(i.type || "Unspecified"));
+    return Array.from(set).sort();
+  }, [items]);
+
   const filteredGroups = useMemo(() => {
     const groupMap = new Map<string, CategoryGroup>();
 
@@ -197,6 +204,12 @@ export default function ReportsPage() {
       if (
         filterLocation !== "all" &&
         (it.location || "Unspecified") !== filterLocation
+      ) {
+        return false;
+      }
+      if (
+        filterType !== "all" &&
+        (it.type || "Unspecified") !== filterType
       ) {
         return false;
       }
@@ -230,19 +243,21 @@ export default function ReportsPage() {
     return Array.from(groupMap.values()).sort((a, b) =>
       a.category.localeCompare(b.category)
     );
-  }, [items, filterCategory, filterLocation, search]);
+  }, [items, filterCategory, filterLocation, filterType, search]);
 
   const overall = {
     categories: filteredGroups.length,
-    totalItems: filteredGroups.reduce(
-      (sum, g) => sum + g.totalQty,
-      0
-    ),
-    totalValue: filteredGroups.reduce(
-      (sum, g) => sum + g.totalValue,
-      0
-    ),
+    totalItems: filteredGroups.reduce((sum, g) => sum + g.totalQty, 0),
+    totalValue: filteredGroups.reduce((sum, g) => sum + g.totalValue, 0),
     lowStock: items.filter((i) => i.quantity < 5).length,
+  };
+
+  const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+
+  const getLastVerificationText = (itemId: string) => {
+    const lv = lastVerifications[itemId];
+    if (!lv) return "No verification on record";
+    return `Last verified ${lv.verified_at} → Qty ${lv.verified_qty}`;
   };
 
   const handleOpenItem = (it: Item) => {
@@ -252,6 +267,41 @@ export default function ReportsPage() {
     setVerDate(new Date().toISOString().slice(0, 10));
     setVerQty(it.quantity);
     setVerNotes("");
+    const lv = lastVerifications[it.id];
+    setVerPhotoUrl(null);
+  };
+
+  // upload verification photo for this transaction
+  const uploadVerificationPhoto = async (file: File) => {
+    if (!userId || !selectedItem) return;
+
+    try {
+      const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
+      const fileName = `${Date.now()}-ver-${selectedItem.id}.${ext}`;
+      const path = `${userId}/verifications/${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("item-images")
+        .upload(path, file, { upsert: false });
+
+      if (uploadError) {
+        console.error(uploadError);
+        setVerificationError("Verification photo upload failed.");
+        return;
+      }
+
+      const { data } = supabase.storage.from("item-images").getPublicUrl(path);
+      const url = data.publicUrl;
+      setVerPhotoUrl(url);
+    } catch (err) {
+      console.error(err);
+      setVerificationError("Unexpected error uploading verification photo.");
+    }
+  };
+
+  const handleVerPhotoChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) void uploadVerificationPhoto(file);
   };
 
   const handleAddVerification = async () => {
@@ -268,8 +318,7 @@ export default function ReportsPage() {
     try {
       const qtyNum = Number(verQty);
 
-      const { data: userData } = await supabase.auth.getUser();
-      const verifiedBy = userData?.user?.id || null;
+      const verifiedBy = userId;
 
       const { error } = await supabase.from("stock_verifications").insert({
         item_id: selectedItem.id,
@@ -277,6 +326,7 @@ export default function ReportsPage() {
         verified_qty: qtyNum,
         notes: verNotes.trim() || "Periodic stock verification",
         verified_by: verifiedBy,
+        photo_url: verPhotoUrl,
       });
 
       if (error) {
@@ -286,13 +336,13 @@ export default function ReportsPage() {
         return;
       }
 
-      // Update last verification map locally
       setLastVerifications((prev) => ({
         ...prev,
         [selectedItem.id]: {
           item_id: selectedItem.id,
           verified_at: verDate || new Date().toISOString().slice(0, 10),
           verified_qty: qtyNum,
+          photo_url: verPhotoUrl,
         },
       }));
 
@@ -303,16 +353,6 @@ export default function ReportsPage() {
     } finally {
       setSavingVerification(false);
     }
-  };
-
-  const formatCurrency = (val: number) => {
-    return `$${val.toFixed(2)}`;
-  };
-
-  const getLastVerificationText = (itemId: string) => {
-    const lv = lastVerifications[itemId];
-    if (!lv) return "No verification on record";
-    return `Last verified ${lv.verified_at} → Qty ${lv.verified_qty}`;
   };
 
   return (
@@ -337,7 +377,7 @@ export default function ReportsPage() {
                 Inventory Reports
               </p>
               <p className="text-xs text-slate-500">
-                Category, location & verification overview
+                Category, type, location & verification overview
               </p>
             </div>
           </div>
@@ -386,6 +426,24 @@ export default function ReportsPage() {
               {locationOptions.map((loc) => (
                 <option key={loc} value={loc}>
                   {loc}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex flex-col">
+            <label className="text-xs font-medium text-slate-600 mb-1">
+              Type
+            </label>
+            <select
+              value={filterType}
+              onChange={(e) => setFilterType(e.target.value)}
+              className="px-3 py-1.5 border rounded-lg text-sm"
+            >
+              <option value="all">All</option>
+              {typeOptions.map((t) => (
+                <option key={t} value={t}>
+                  {t}
                 </option>
               ))}
             </select>
@@ -491,6 +549,7 @@ export default function ReportsPage() {
                     <thead className="bg-white border-b">
                       <tr className="text-left text-[11px] text-slate-500">
                         <th className="px-3 py-2">Item</th>
+                        <th className="px-3 py-2">Type</th>
                         <th className="px-3 py-2">Location</th>
                         <th className="px-3 py-2">TE#</th>
                         <th className="px-3 py-2 text-right">Qty</th>
@@ -524,6 +583,9 @@ export default function ReportsPage() {
                                   </span>
                                 )}
                               </div>
+                            </td>
+                            <td className="px-3 py-2 align-top text-[11px] text-slate-600">
+                              {it.type || "Unspecified"}
                             </td>
                             <td className="px-3 py-2 align-top">
                               <div className="inline-flex items-center gap-1 text-slate-600">
@@ -623,7 +685,15 @@ export default function ReportsPage() {
               </div>
 
               {/* Details */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-slate-50 rounded-xl p-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-slate-50 rounded-xl p-4">
+                <div>
+                  <p className="text-[11px] text-slate-500 mb-1 uppercase">
+                    Type
+                  </p>
+                  <p className="text-sm font-medium text-slate-900">
+                    {selectedItem.type || "Unspecified"}
+                  </p>
+                </div>
                 <div>
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Category
@@ -676,6 +746,24 @@ export default function ReportsPage() {
                   <p className="text-sm text-slate-800">
                     {selectedItem.description}
                   </p>
+                </div>
+              )}
+
+              {/* Latest verification photo (if any) */}
+              {lastVerifications[selectedItem.id]?.photo_url && (
+                <div className="bg-white rounded-xl border p-4">
+                  <p className="text-[11px] text-slate-500 mb-1 uppercase">
+                    Latest Verification Photo
+                  </p>
+                  <div className="w-full max-w-xs">
+                    <img
+                      src={
+                        lastVerifications[selectedItem.id]?.photo_url as string
+                      }
+                      alt="Latest verification"
+                      className="w-full h-auto rounded-lg border"
+                    />
+                  </div>
                 </div>
               )}
 
@@ -736,7 +824,38 @@ export default function ReportsPage() {
                     />
                   </div>
                 </div>
-                <div className="flex justify-end">
+
+                {/* Verification photo upload */}
+                <div className="mt-3 text-xs">
+                  <label className="block text-slate-600 mb-1">
+                    Verification Photo (optional)
+                  </label>
+                  <label className="inline-flex items-center gap-2 px-3 py-2 border border-dashed rounded-lg cursor-pointer hover:border-slate-400">
+                    <Upload className="w-4 h-4" />
+                    <span>
+                      {verPhotoUrl
+                        ? "Change verification photo"
+                        : "Upload verification photo"}
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={handleVerPhotoChange}
+                    />
+                  </label>
+                  {verPhotoUrl && (
+                    <div className="mt-2 max-w-xs">
+                      <img
+                        src={verPhotoUrl}
+                        alt="Verification preview"
+                        className="w-full h-auto rounded-md border"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex justify-end mt-3">
                   <button
                     type="button"
                     onClick={handleAddVerification}

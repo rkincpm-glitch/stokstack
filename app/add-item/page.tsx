@@ -18,6 +18,7 @@ import {
 
 const ADD_CATEGORY = "__ADD_CATEGORY__";
 const ADD_LOCATION = "__ADD_LOCATION__";
+const ADD_TYPE = "__ADD_TYPE__";
 
 interface Category {
   id: string;
@@ -25,6 +26,11 @@ interface Category {
 }
 
 interface Location {
+  id: string;
+  name: string;
+}
+
+interface ItemType {
   id: string;
   name: string;
 }
@@ -41,6 +47,7 @@ export default function AddItemPage() {
     name: "",
     teNumber: "",
     description: "",
+    type: "",
     category: "",
     location: "",
     quantity: "" as number | "",
@@ -55,6 +62,10 @@ export default function AddItemPage() {
 
   const [categories, setCategories] = useState<Category[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
+  const [itemTypes, setItemTypes] = useState<ItemType[]>([]);
+
+  // photo for initial verification
+  const [verifyPhotoUrl, setVerifyPhotoUrl] = useState<string | null>(null);
 
   // ------------ helpers ------------
 
@@ -62,10 +73,9 @@ export default function AddItemPage() {
     setForm((f) => ({ ...f, [key]: value }));
   };
 
-  // Insert new category/location. It still stores user_id for history,
-  // but we DO NOT filter by user when reading them (shared for all).
+  // Insert new master record (category/location/type). Shared for all users.
   const addMasterItem = async (
-    table: "categories" | "locations",
+    table: "categories" | "locations" | "item_types",
     name: string
   ): Promise<{ id: string; name: string } | null> => {
     if (!userId || !name.trim()) return null;
@@ -78,21 +88,25 @@ export default function AddItemPage() {
         .single();
 
       if (error || !data) {
-        console.error(`Failed to add ${table.slice(0, 1)}:`, error);
-        setError(`Failed to add ${table.slice(0, -1)}.`);
+        console.error(`Failed to add ${table}:`, error);
+        setError(`Failed to add ${table}.`);
         return null;
       }
 
+      const typedData = data as { id: string; name: string };
+
       if (table === "categories") {
-        setCategories((prev) => [...prev, data as Category]);
+        setCategories((prev) => [...prev, typedData]);
+      } else if (table === "locations") {
+        setLocations((prev) => [...prev, typedData]);
       } else {
-        setLocations((prev) => [...prev, data as Location]);
+        setItemTypes((prev) => [...prev, typedData]);
       }
 
-      return data as { id: string; name: string };
+      return typedData;
     } catch (err) {
       console.error(err);
-      setError(`Unexpected error adding ${table.slice(0, -1)}.`);
+      setError(`Unexpected error adding ${table}.`);
       return null;
     }
   };
@@ -118,10 +132,11 @@ export default function AddItemPage() {
 
         setUserId(user.id);
 
-        // NOTE: shared categories/locations – NO user_id filter here
-        const [catsResult, locsResult] = await Promise.allSettled([
+        // shared: no user_id filters
+        const [catsResult, locsResult, typesResult] = await Promise.allSettled([
           supabase.from("categories").select("id, name").order("name"),
           supabase.from("locations").select("id, name").order("name"),
+          supabase.from("item_types").select("id, name").order("name"),
         ]);
 
         if (
@@ -139,6 +154,14 @@ export default function AddItemPage() {
         ) {
           setLocations(locsResult.value.data as Location[]);
         }
+
+        if (
+          typesResult.status === "fulfilled" &&
+          !typesResult.value.error &&
+          typesResult.value.data
+        ) {
+          setItemTypes(typesResult.value.data as ItemType[]);
+        }
       } catch (err) {
         console.error("Init error:", err);
         setError("Failed to load initial data.");
@@ -150,7 +173,7 @@ export default function AddItemPage() {
     void init();
   }, [router]);
 
-  // ------------ category/location change ------------
+  // ------------ category/location/type change ------------
 
   const handleCategoryChange = async (value: string) => {
     if (value === ADD_CATEGORY) {
@@ -176,7 +199,19 @@ export default function AddItemPage() {
     }
   };
 
-  // ------------ image upload ------------
+  const handleTypeChange = async (value: string) => {
+    if (value === ADD_TYPE) {
+      const name = prompt("Enter new type (e.g. Tool, Equipment, Material):");
+      if (!name?.trim()) return;
+
+      const added = await addMasterItem("item_types", name);
+      if (added) updateForm("type", added.name);
+    } else {
+      updateForm("type", value);
+    }
+  };
+
+  // ------------ image upload (items) ------------
 
   const uploadImage = async (file: File, type: "primary" | "secondary") => {
     if (!userId) return;
@@ -184,7 +219,7 @@ export default function AddItemPage() {
     try {
       const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
       const fileName = `${Date.now()}-${type}.${ext}`;
-      const path = `${userId}/${fileName}`;
+      const path = `${userId}/items/${fileName}`;
 
       const { error: uploadError } = await supabase.storage
         .from("item-images")
@@ -213,6 +248,40 @@ export default function AddItemPage() {
   ) => {
     const file = e.target.files?.[0];
     if (file) void uploadImage(file, type);
+  };
+
+  // ------------ image upload (verification photo) ------------
+
+  const uploadVerificationPhoto = async (file: File) => {
+    if (!userId) return;
+
+    try {
+      const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
+      const fileName = `${Date.now()}-verification.${ext}`;
+      const path = `${userId}/verifications/${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("item-images")
+        .upload(path, file, { upsert: false });
+
+      if (uploadError) {
+        console.error(uploadError);
+        setError("Verification photo upload failed. Try again.");
+        return;
+      }
+
+      const { data } = supabase.storage.from("item-images").getPublicUrl(path);
+      const url = data.publicUrl;
+      setVerifyPhotoUrl(url);
+    } catch (err) {
+      console.error(err);
+      setError("Unexpected error while uploading verification photo.");
+    }
+  };
+
+  const handleVerifyPhotoChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) void uploadVerificationPhoto(file);
   };
 
   // ------------ submit ------------
@@ -259,6 +328,7 @@ export default function AddItemPage() {
           name: form.name.trim(),
           te_number: form.teNumber.trim() || null,
           description: form.description.trim() || null,
+          type: form.type || null,
           category: form.category || null,
           location: form.location || null,
           quantity: quantityNum,
@@ -277,6 +347,7 @@ export default function AddItemPage() {
         return;
       }
 
+      // Initial verification (with optional photo)
       if (form.verifyOnCreate && item.id) {
         try {
           await supabase.from("stock_verifications").insert({
@@ -285,6 +356,7 @@ export default function AddItemPage() {
             verified_qty: quantityNum,
             notes: form.verifyNotes.trim() || "Initial stock on creation",
             verified_by: userId,
+            photo_url: verifyPhotoUrl,
           });
         } catch (verErr) {
           console.error("Verification insert error:", verErr);
@@ -292,6 +364,20 @@ export default function AddItemPage() {
       }
 
       setSuccess(true);
+      // Reset some fields, but keep type/category/location for convenience
+      setForm((prev) => ({
+        ...prev,
+        name: "",
+        teNumber: "",
+        description: "",
+        quantity: "",
+        purchasePrice: "",
+        verifyNotes: "",
+      }));
+      setImageUrl(null);
+      setImageUrl2(null);
+      setVerifyPhotoUrl(null);
+
       setTimeout(() => router.push("/"), 900);
     } catch (err) {
       console.error("Submit error:", err);
@@ -430,12 +516,35 @@ export default function AddItemPage() {
             </div>
           </section>
 
-          {/* Category & Location */}
+          {/* Type, Category & Location */}
           <section className="space-y-4">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
-              Categorization
+              Classification
             </h2>
-            <div className="grid gap-5 sm:grid-cols-2">
+            <div className="grid gap-5 sm:grid-cols-3">
+              {/* Type */}
+              <div>
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-sm font-medium text-slate-700">
+                    Type
+                  </label>
+                </div>
+                <select
+                  value={form.type}
+                  onChange={(e) => handleTypeChange(e.target.value)}
+                  className="w-full px-4 py-2.5 border rounded-lg"
+                >
+                  <option value="">Select or add...</option>
+                  {itemTypes.map((t) => (
+                    <option key={t.id} value={t.name}>
+                      {t.name}
+                    </option>
+                  ))}
+                  <option value={ADD_TYPE}>+ Add new type...</option>
+                </select>
+              </div>
+
+              {/* Category */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -463,6 +572,7 @@ export default function AddItemPage() {
                 </select>
               </div>
 
+              {/* Location */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -530,20 +640,20 @@ export default function AddItemPage() {
                   <span className="absolute left-3 top-2.5 text-slate-500">
                     <Calendar className="w-5 h-5" />
                   </span>
-                <input
-                  type="date"
-                  value={form.purchaseDate}
-                  onChange={(e) =>
-                    updateForm("purchaseDate", e.target.value)
-                  }
-                  className="w-full pl-10 pr-4 py-2.5 border rounded-lg"
-                />
+                  <input
+                    type="date"
+                    value={form.purchaseDate}
+                    onChange={(e) =>
+                      updateForm("purchaseDate", e.target.value)
+                    }
+                    className="w-full pl-10 pr-4 py-2.5 border rounded-lg"
+                  />
                 </div>
               </div>
             </div>
           </section>
 
-          {/* Images */}
+          {/* Photos */}
           <section className="space-y-4">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Photos
@@ -610,7 +720,7 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Initial Stock Verification
             </h2>
-            <div className="bg-slate-50 border rounded-xl p-4">
+            <div className="bg-slate-50 border rounded-xl p-4 space-y-3">
               <label className="flex items-start gap-3 text-sm">
                 <input
                   type="checkbox"
@@ -625,21 +735,61 @@ export default function AddItemPage() {
                   audit trail)
                 </span>
               </label>
+
               {form.verifyOnCreate && (
-                <div className="mt-4">
-                  <label className="block text-sm font-medium text-slate-700 mb-1">
-                    Notes (optional)
-                  </label>
-                  <input
-                    type="text"
-                    value={form.verifyNotes}
-                    onChange={(e) =>
-                      updateForm("verifyNotes", e.target.value)
-                    }
-                    placeholder="e.g. Physically counted in warehouse"
-                    className="w-full px-4 py-2 border rounded-lg"
-                  />
-                </div>
+                <>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">
+                      Notes (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={form.verifyNotes}
+                      onChange={(e) =>
+                        updateForm("verifyNotes", e.target.value)
+                      }
+                      placeholder="e.g. Physically counted in warehouse"
+                      className="w-full px-4 py-2 border rounded-lg"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-1">
+                      Verification Photo (optional)
+                    </label>
+                    <label className="block border-2 border-dashed border-slate-300 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
+                      {verifyPhotoUrl ? (
+                        <div className="relative group">
+                          <img
+                            src={verifyPhotoUrl}
+                            alt="Verification"
+                            className="w-full h-40 object-cover rounded-lg"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setVerifyPhotoUrl(null)}
+                            className="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition"
+                          >
+                            <X className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="text-center text-slate-400">
+                          <Upload className="w-8 h-8 mx-auto mb-2" />
+                          <p className="text-xs">
+                            Click to upload verification photo
+                          </p>
+                        </div>
+                      )}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={handleVerifyPhotoChange}
+                      />
+                    </label>
+                  </div>
+                </>
               )}
             </div>
           </section>
