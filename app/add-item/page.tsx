@@ -19,6 +19,7 @@ import {
   Calendar,
   DollarSign,
   CheckCircle2,
+  Settings2,
 } from "lucide-react";
 
 type CategoryRow = {
@@ -61,13 +62,18 @@ export default function AddItemPage() {
   const [verifyOnCreate, setVerifyOnCreate] = useState(true);
   const [verifyNotes, setVerifyNotes] = useState("");
 
-  // Category & Location master data (names only)
+  // Category & Location master data (names only for now)
   const [categories, setCategories] = useState<string[]>([]);
   const [locations, setLocations] = useState<string[]>([]);
 
   useEffect(() => {
     const init = async () => {
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData, error: userError } = await supabase.auth.getUser();
+
+      if (userError) {
+        console.error("Error fetching user:", userError);
+      }
+
       if (!userData?.user) {
         router.push("/auth");
         return;
@@ -86,7 +92,7 @@ export default function AddItemPage() {
       setLoading(false);
     };
 
-    init();
+    void init();
   }, [router]);
 
   const loadCategories = async (uid: string) => {
@@ -100,6 +106,7 @@ export default function AddItemPage() {
       console.error("Error loading categories:", error);
       return;
     }
+
     const names = (data as CategoryRow[]).map((c) => c.name);
     setCategories(names);
   };
@@ -115,6 +122,7 @@ export default function AddItemPage() {
       console.error("Error loading locations:", error);
       return;
     }
+
     const names = (data as LocationRow[]).map((l) => l.name);
     setLocations(names);
   };
@@ -161,16 +169,13 @@ export default function AddItemPage() {
   const handleCategorySelect = async (value: string) => {
     if (!userId) return;
 
-    // If regular category selected, just set it
     if (value !== ADD_CATEGORY_VALUE) {
       setCategory(value);
       return;
     }
 
-    // Add new category flow
     const newName = window.prompt("Enter new category name:");
     if (!newName || !newName.trim()) {
-      // user cancelled or empty -> keep previous selection
       return;
     }
 
@@ -184,11 +189,10 @@ export default function AddItemPage() {
 
     if (error) {
       console.error("Error adding category:", error);
-      setErrorMsg("Could not add category. Check console for details.");
+      setErrorMsg("Could not add category. Please try again.");
       return;
     }
 
-    // Update list & select new category
     setCategories((prev) =>
       Array.from(new Set([...prev, trimmed])).sort()
     );
@@ -219,7 +223,7 @@ export default function AddItemPage() {
 
     if (error) {
       console.error("Error adding location:", error);
-      setErrorMsg("Could not add location. Check console for details.");
+      setErrorMsg("Could not add location. Please try again.");
       return;
     }
 
@@ -244,11 +248,25 @@ export default function AddItemPage() {
         return;
       }
 
-      const qty = quantity === "" ? 0 : Number(quantity);
+      if (quantity === "" || Number.isNaN(Number(quantity))) {
+        setErrorMsg("Quantity is required and must be a number.");
+        setSaving(false);
+        return;
+      }
+
+      const qty = Number(quantity);
+      if (qty < 0) {
+        setErrorMsg("Quantity cannot be negative.");
+        setSaving(false);
+        return;
+      }
+
       const priceNum =
         purchasePrice === "" ? null : Number(purchasePrice);
       const price =
-        priceNum === null || Number.isNaN(priceNum) ? null : priceNum;
+        priceNum === null || Number.isNaN(priceNum) || priceNum < 0
+          ? null
+          : priceNum;
 
       const { data: inserted, error } = await supabase
         .from("items")
@@ -292,7 +310,7 @@ export default function AddItemPage() {
 
         if (verError) {
           console.error("Error creating initial verification:", verError);
-          // don't block success on this
+          // do not block success on this
         }
       }
 
@@ -451,7 +469,7 @@ export default function AddItemPage() {
 
           {/* Category & Location */}
           <section className="space-y-4">
-            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
+            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide flex items-center gap-2">
               Categorization
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -461,16 +479,24 @@ export default function AddItemPage() {
                   <label className="block text-xs font-medium text-slate-600">
                     Category
                   </label>
-                  <span className="text-[11px] text-slate-400">
-                    e.g. Power Tools, PPE, Formwork
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      e.g. Power Tools, PPE, Formwork
+                    </span>
+                    {/* Direct link to category management */}
+                    <Link
+                      href="/settings/categories"
+                      className="inline-flex items-center gap-1 text-[11px] text-blue-600 hover:text-blue-800"
+                    >
+                      <Settings2 className="w-3 h-3" />
+                      Manage
+                    </Link>
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <select
                     value={category || ""}
-                    onChange={(e) =>
-                      handleCategorySelect(e.target.value)
-                    }
+                    onChange={(e) => handleCategorySelect(e.target.value)}
                     className="w-full px-3 py-2 border rounded-lg text-sm"
                   >
                     <option value="">Select category</option>
@@ -493,16 +519,24 @@ export default function AddItemPage() {
                   <label className="block text-xs font-medium text-slate-600">
                     Location
                   </label>
-                  <span className="text-[11px] text-slate-400">
-                    e.g. MER Level, North Tube, Container 3
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-slate-400">
+                      e.g. MER Level, North Tube, Container 3
+                    </span>
+                    {/* Direct link to location management */}
+                    <Link
+                      href="/settings/locations"
+                      className="inline-flex items-center gap-1 text-[11px] text-blue-600 hover:text-blue-800"
+                    >
+                      <Settings2 className="w-3 h-3" />
+                      Manage
+                    </Link>
+                  </div>
                 </div>
                 <div className="flex gap-2">
                   <select
                     value={location || ""}
-                    onChange={(e) =>
-                      handleLocationSelect(e.target.value)
-                    }
+                    onChange={(e) => handleLocationSelect(e.target.value)}
                     className="w-full px-3 py-2 border rounded-lg text-sm"
                   >
                     <option value="">Select location</option>
