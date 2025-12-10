@@ -56,12 +56,14 @@ export default function AddItemPage() {
   const [categories, setCategories] = useState<Category[]>([]);
   const [locations, setLocations] = useState<Location[]>([]);
 
-  // ---------- helpers ----------
+  // ------------ helpers ------------
 
   const updateForm = (key: keyof typeof form, value: any) => {
     setForm((f) => ({ ...f, [key]: value }));
   };
 
+  // Insert new category/location. It still stores user_id for history,
+  // but we DO NOT filter by user when reading them (shared for all).
   const addMasterItem = async (
     table: "categories" | "locations",
     name: string
@@ -76,18 +78,18 @@ export default function AddItemPage() {
         .single();
 
       if (error || !data) {
-        console.error(`Failed to add ${table.slice(0, -1)}:`, error);
+        console.error(`Failed to add ${table.slice(0, 1)}:`, error);
         setError(`Failed to add ${table.slice(0, -1)}.`);
         return null;
       }
 
       if (table === "categories") {
-        setCategories((prev) => [...prev, data]);
+        setCategories((prev) => [...prev, data as Category]);
       } else {
-        setLocations((prev) => [...prev, data]);
+        setLocations((prev) => [...prev, data as Location]);
       }
 
-      return data;
+      return data as { id: string; name: string };
     } catch (err) {
       console.error(err);
       setError(`Unexpected error adding ${table.slice(0, -1)}.`);
@@ -95,7 +97,7 @@ export default function AddItemPage() {
     }
   };
 
-  // ---------- data load ----------
+  // ------------ load user + master data ------------
 
   useEffect(() => {
     async function init() {
@@ -116,17 +118,10 @@ export default function AddItemPage() {
 
         setUserId(user.id);
 
+        // NOTE: shared categories/locations – NO user_id filter here
         const [catsResult, locsResult] = await Promise.allSettled([
-          supabase
-            .from("categories")
-            .select("id, name")
-            .eq("user_id", user.id)
-            .order("name"),
-          supabase
-            .from("locations")
-            .select("id, name")
-            .eq("user_id", user.id)
-            .order("name"),
+          supabase.from("categories").select("id, name").order("name"),
+          supabase.from("locations").select("id, name").order("name"),
         ]);
 
         if (
@@ -155,7 +150,7 @@ export default function AddItemPage() {
     void init();
   }, [router]);
 
-  // ---------- category/location change ----------
+  // ------------ category/location change ------------
 
   const handleCategoryChange = async (value: string) => {
     if (value === ADD_CATEGORY) {
@@ -181,7 +176,7 @@ export default function AddItemPage() {
     }
   };
 
-  // ---------- image upload ----------
+  // ------------ image upload ------------
 
   const uploadImage = async (file: File, type: "primary" | "secondary") => {
     if (!userId) return;
@@ -220,7 +215,7 @@ export default function AddItemPage() {
     if (file) void uploadImage(file, type);
   };
 
-  // ---------- submit ----------
+  // ------------ submit ------------
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -231,7 +226,6 @@ export default function AddItemPage() {
     setSuccess(false);
 
     try {
-      // Validation
       if (!form.name.trim()) {
         setError("Item name is required.");
         setSaving(false);
@@ -283,7 +277,6 @@ export default function AddItemPage() {
         return;
       }
 
-      // Optional initial verification
       if (form.verifyOnCreate && item.id) {
         try {
           await supabase.from("stock_verifications").insert({
@@ -295,7 +288,6 @@ export default function AddItemPage() {
           });
         } catch (verErr) {
           console.error("Verification insert error:", verErr);
-          // non-blocking
         }
       }
 
@@ -309,7 +301,7 @@ export default function AddItemPage() {
     }
   };
 
-  // ---------- render ----------
+  // ------------ render ------------
 
   if (loading) {
     return (
@@ -428,7 +420,9 @@ export default function AddItemPage() {
                 <textarea
                   rows={3}
                   value={form.description}
-                  onChange={(e) => updateForm("description", e.target.value)}
+                  onChange={(e) =>
+                    updateForm("description", e.target.value)
+                  }
                   placeholder="Condition, specs, accessories..."
                   className="w-full px-4 py-2.5 border rounded-lg"
                 />
@@ -536,14 +530,14 @@ export default function AddItemPage() {
                   <span className="absolute left-3 top-2.5 text-slate-500">
                     <Calendar className="w-5 h-5" />
                   </span>
-                  <input
-                    type="date"
-                    value={form.purchaseDate}
-                    onChange={(e) =>
-                      updateForm("purchaseDate", e.target.value)
-                    }
-                    className="w-full pl-10 pr-4 py-2.5 border rounded-lg"
-                  />
+                <input
+                  type="date"
+                  value={form.purchaseDate}
+                  onChange={(e) =>
+                    updateForm("purchaseDate", e.target.value)
+                  }
+                  className="w-full pl-10 pr-4 py-2.5 border rounded-lg"
+                />
                 </div>
               </div>
             </div>
