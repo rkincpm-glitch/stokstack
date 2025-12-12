@@ -16,6 +16,11 @@ import {
   X,
   CheckCircle2,
   Upload,
+  Activity,
+  TrendingUp,
+  Clock,
+  FileSpreadsheet,
+  FileText,
 } from "lucide-react";
 
 type Item = {
@@ -48,18 +53,23 @@ type LastVerification = {
   photo_url?: string | null;
 };
 
+const VERIFICATION_STALE_DAYS = 90;
+const LOW_STOCK_THRESHOLD = 5;
+
 export default function ReportsPage() {
   const router = useRouter();
 
   const [userId, setUserId] = useState<string | null>(null);
   const [items, setItems] = useState<Item[]>([]);
   const [groups, setGroups] = useState<CategoryGroup[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [selectedItem, setSelectedItem] = useState<Item | null>(null);
   const [lastVerifications, setLastVerifications] = useState<
     Record<string, LastVerification>
   >({});
+
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const [selectedItem, setSelectedItem] = useState<Item | null>(null);
 
   // Filters
   const [filterCategory, setFilterCategory] = useState<string>("all");
@@ -119,31 +129,7 @@ export default function ReportsPage() {
       const allItems = (itemsData || []) as Item[];
       setItems(allItems);
 
-      // Last verifications
-      const { data: verData, error: verError } = await supabase
-        .from("stock_verifications")
-        .select("item_id, verified_at, verified_qty, photo_url")
-        .order("verified_at", { ascending: false });
-
-      if (verError) {
-        console.error("Error loading stock verifications:", verError);
-      } else {
-        const map: Record<string, LastVerification> = {};
-        for (const row of verData || []) {
-          const itemId = row.item_id as string;
-          if (!map[itemId]) {
-            map[itemId] = {
-              item_id: itemId,
-              verified_at: row.verified_at as string,
-              verified_qty: row.verified_qty as number,
-              photo_url: (row as any).photo_url ?? null,
-            };
-          }
-        }
-        setLastVerifications(map);
-      }
-
-      // Group all items by category
+      // Group all items by category (raw, before filters)
       const groupMap = new Map<string, CategoryGroup>();
       for (const it of allItems) {
         const key = it.category || "Uncategorized";
@@ -166,6 +152,30 @@ export default function ReportsPage() {
         a.category.localeCompare(b.category)
       );
       setGroups(grouped);
+
+      // Last verifications
+      const { data: verData, error: verError } = await supabase
+        .from("stock_verifications")
+        .select("item_id, verified_at, verified_qty, photo_url")
+        .order("verified_at", { ascending: false });
+
+      if (verError) {
+        console.error("Error loading stock verifications:", verError);
+      } else {
+        const map: Record<string, LastVerification> = {};
+        for (const row of (verData || []) as any[]) {
+          const itemId = row.item_id as string;
+          if (!map[itemId]) {
+            map[itemId] = {
+              item_id: itemId,
+              verified_at: row.verified_at as string,
+              verified_qty: row.verified_qty as number,
+              photo_url: row.photo_url ?? null,
+            };
+          }
+        }
+        setLastVerifications(map);
+      }
     } catch (err) {
       console.error(err);
       setErrorMsg("Unexpected error while loading reports.");
@@ -174,7 +184,41 @@ export default function ReportsPage() {
     }
   };
 
-  // Options for filters
+  // Helpers
+  const daysSince = (isoDate: string) => {
+    const d = new Date(isoDate);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+  };
+
+  const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+
+  const getLastVerificationText = (itemId: string) => {
+    const lv = lastVerifications[itemId];
+    if (!lv) return "No verification on record";
+    const days = daysSince(lv.verified_at);
+    const ageLabel =
+      days <= VERIFICATION_STALE_DAYS
+        ? `${days} days ago`
+        : `${days} days ago (stale)`;
+    return `Last verified ${ageLabel} → Qty ${lv.verified_qty}`;
+  };
+
+  const getLastVerificationMeta = (itemId: string) => {
+    const lv = lastVerifications[itemId];
+    if (!lv) {
+      return { date: "", qty: "", age: "" };
+    }
+    const age = daysSince(lv.verified_at);
+    return {
+      date: lv.verified_at,
+      qty: String(lv.verified_qty),
+      age: String(age),
+    };
+  };
+
+  // Derived options for filters (from all items)
   const categoryOptions = useMemo(() => {
     const set = new Set<string>();
     items.forEach((i) => set.add(i.category || "Uncategorized"));
@@ -193,6 +237,7 @@ export default function ReportsPage() {
     return Array.from(set).sort();
   }, [items]);
 
+  // Filtered groups for the main table
   const filteredGroups = useMemo(() => {
     const groupMap = new Map<string, CategoryGroup>();
 
@@ -244,20 +289,73 @@ export default function ReportsPage() {
     );
   }, [items, filterCategory, filterLocation, filterType, search]);
 
-  const overall = {
-    categories: filteredGroups.length,
-    totalItems: filteredGroups.reduce((sum, g) => sum + g.totalQty, 0),
-    totalValue: filteredGroups.reduce((sum, g) => sum + g.totalValue, 0),
-    lowStock: items.filter((i) => i.quantity < 5).length,
-  };
+  // High-level metrics for management
+  const overall = useMemo(() => {
+    const totalValue = items.reduce(
+      (sum, i) => sum + (i.purchase_price || 0) * i.quantity,
+      0
+    );
+    const totalQty = items.reduce((sum, i) => sum + i.quantity, 0);
 
-  const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+    const lowStockCount = items.filter(
+      (i) => i.quantity > 0 && i.quantity < LOW_STOCK_THRESHOLD
+    ).length;
 
-  const getLastVerificationText = (itemId: string) => {
-    const lv = lastVerifications[itemId];
-    if (!lv) return "No verification on record";
-    return `Last verified ${lv.verified_at} → Qty ${lv.verified_qty}`;
-  };
+    const staleOrNeverVerifiedCount = items.filter((i) => {
+      const lv = lastVerifications[i.id];
+      if (!lv) return true;
+      const days = daysSince(lv.verified_at);
+      return days > VERIFICATION_STALE_DAYS;
+    }).length;
+
+    const avgUnitValue =
+      totalQty > 0 ? totalValue / totalQty : 0;
+
+    return {
+      totalValue,
+      totalQty,
+      lowStockCount,
+      staleOrNeverVerifiedCount,
+      avgUnitValue,
+      categories: groups.length,
+    };
+  }, [items, lastVerifications, groups]);
+
+  // Top categories by value
+  const topCategoriesByValue = useMemo(() => {
+    const sorted = [...groups].sort((a, b) => b.totalValue - a.totalValue);
+    return sorted.slice(0, 5);
+  }, [groups]);
+
+  // Top items by value (absolute)
+  const topItemsByValue = useMemo(() => {
+    const withValue = items.map((i) => ({
+      ...i,
+      totalValue: (i.purchase_price || 0) * i.quantity,
+    }));
+    withValue.sort((a, b) => b.totalValue - a.totalValue);
+    return withValue.slice(0, 5);
+  }, [items]);
+
+  // Low stock items list
+  const lowStockItems = useMemo(
+    () =>
+      items
+        .filter((i) => i.quantity > 0 && i.quantity < LOW_STOCK_THRESHOLD)
+        .slice(0, 5),
+    [items]
+  );
+
+  // Verification-stale items
+  const staleVerificationItems = useMemo(() => {
+    const flagged = items.filter((i) => {
+      const lv = lastVerifications[i.id];
+      if (!lv) return true;
+      const days = daysSince(lv.verified_at);
+      return days > VERIFICATION_STALE_DAYS;
+    });
+    return flagged.slice(0, 5);
+  }, [items, lastVerifications]);
 
   const handleOpenItem = (it: Item) => {
     setSelectedItem(it);
@@ -352,30 +450,260 @@ export default function ReportsPage() {
     }
   };
 
+  // ---------- EXPORT HELPERS ----------
+
+  const escapeCsv = (value: string | number | null | undefined) => {
+    if (value === null || value === undefined) return "";
+    const str = String(value);
+    if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+      return `"${str.replace(/"/g, '""')}"`;
+    }
+    return str;
+  };
+
+  const escapeHtml = (value: string) =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const buildFlatRows = () => {
+    const rows: {
+      category: string;
+      type: string;
+      name: string;
+      location: string;
+      te: string;
+      qty: number;
+      unitPrice: number;
+      totalValue: number;
+      lastVerDate: string;
+      lastVerQty: string;
+      lastVerAge: string;
+    }[] = [];
+
+    for (const g of filteredGroups) {
+      for (const it of g.items) {
+        const lvMeta = getLastVerificationMeta(it.id);
+        const unit = it.purchase_price || 0;
+        const total = unit * it.quantity;
+        rows.push({
+          category: g.category,
+          type: it.type || "Unspecified",
+          name: it.name,
+          location: it.location || "",
+          te: it.te_number || "",
+          qty: it.quantity,
+          unitPrice: unit,
+          totalValue: total,
+          lastVerDate: lvMeta.date,
+          lastVerQty: lvMeta.qty,
+          lastVerAge: lvMeta.age,
+        });
+      }
+    }
+
+    return rows;
+  };
+
+  const handleExportExcel = () => {
+    const rows = buildFlatRows();
+    if (rows.length === 0) {
+      alert("No data to export for the current filters.");
+      return;
+    }
+
+    const headers = [
+      "Category",
+      "Type",
+      "Item Name",
+      "Location",
+      "TE Number",
+      "Quantity",
+      "Unit Price",
+      "Total Value",
+      "Last Verification Date",
+      "Last Verification Qty",
+      "Last Verification Age (days)",
+    ];
+
+    const lines = [
+      headers.map(escapeCsv).join(","),
+      ...rows.map((r) =>
+        [
+          r.category,
+          r.type,
+          r.name,
+          r.location,
+          r.te,
+          r.qty,
+          r.unitPrice,
+          r.totalValue,
+          r.lastVerDate,
+          r.lastVerQty,
+          r.lastVerAge,
+        ]
+          .map(escapeCsv)
+          .join(",")
+      ),
+    ];
+
+    const csv = lines.join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const dateStr = new Date().toISOString().slice(0, 10);
+    a.href = url;
+    a.download = `inventory-report-${dateStr}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportPdf = () => {
+    const rows = buildFlatRows();
+    if (rows.length === 0) {
+      alert("No data to export for the current filters.");
+      return;
+    }
+
+    const dateStr = new Date().toLocaleString();
+    let tableRows = "";
+
+    for (const r of rows) {
+      tableRows += `<tr>
+<td>${escapeHtml(r.category)}</td>
+<td>${escapeHtml(r.type)}</td>
+<td>${escapeHtml(r.name)}</td>
+<td>${escapeHtml(r.location)}</td>
+<td>${escapeHtml(r.te)}</td>
+<td>${r.qty}</td>
+<td>${r.unitPrice.toFixed(2)}</td>
+<td>${r.totalValue.toFixed(2)}</td>
+<td>${escapeHtml(r.lastVerDate || "")}</td>
+<td>${escapeHtml(r.lastVerQty || "")}</td>
+<td>${escapeHtml(r.lastVerAge || "")}</td>
+</tr>`;
+    }
+
+    const html = `<!doctype html>
+<html>
+<head>
+<title>Inventory Report</title>
+<meta charset="utf-8" />
+<style>
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 12px;
+  padding: 16px;
+}
+h1 {
+  font-size: 18px;
+  margin-bottom: 4px;
+}
+p {
+  margin: 0 0 8px 0;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th, td {
+  border: 1px solid #ccc;
+  padding: 4px 6px;
+  text-align: left;
+}
+th {
+  background: #f3f4f6;
+}
+</style>
+</head>
+<body>
+<h1>Inventory Report</h1>
+<p>Generated: ${escapeHtml(dateStr)}</p>
+<table>
+<thead>
+<tr>
+  <th>Category</th>
+  <th>Type</th>
+  <th>Item Name</th>
+  <th>Location</th>
+  <th>TE Number</th>
+  <th>Quantity</th>
+  <th>Unit Price</th>
+  <th>Total Value</th>
+  <th>Last Verification Date</th>
+  <th>Last Verification Qty</th>
+  <th>Last Verification Age (days)</th>
+</tr>
+</thead>
+<tbody>
+${tableRows}
+</tbody>
+</table>
+</body>
+</html>`;
+
+    const win = window.open("", "_blank");
+    if (!win) return;
+    win.document.open();
+    win.document.write(html);
+    win.document.close();
+    win.focus();
+    win.print();
+  };
+
+  // ---------- RENDER ----------
+
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-slate-950 text-slate-50">
       {/* Header */}
-      <header className="bg-white border-b border-slate-200">
+      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
           <Link
             href="/"
-            className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900"
+            className="flex items-center gap-2 text-sm text-slate-300 hover:text-white"
           >
             <ArrowLeft className="w-4 h-4" />
             Back to Stokstak
           </Link>
 
-          <div className="flex items-center gap-2">
-            <div className="bg-purple-600 p-2 rounded-lg">
-              <BarChart3 className="w-5 h-5 text-white" />
+          <div className="flex items-center gap-4">
+            {/* Export buttons in header */}
+            <div className="hidden sm:flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleExportExcel}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                Excel (CSV)
+              </button>
+              <button
+                type="button"
+                onClick={handleExportPdf}
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+              >
+                <FileText className="w-4 h-4" />
+                PDF
+              </button>
             </div>
-            <div>
-              <p className="text-sm font-semibold text-slate-900">
-                Inventory Reports
-              </p>
-              <p className="text-xs text-slate-500">
-                Category, type, location & verification overview
-              </p>
+
+            <div className="flex items-center gap-3">
+              <div className="bg-gradient-to-br from-indigo-500 to-purple-500 p-2 rounded-xl shadow-lg shadow-indigo-500/30">
+                <BarChart3 className="w-5 h-5 text-white" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-50">
+                  Inventory Intelligence
+                </p>
+                <p className="text-xs text-slate-400">
+                  Financial & operational overview
+                </p>
+              </div>
             </div>
           </div>
         </div>
@@ -383,23 +711,278 @@ export default function ReportsPage() {
 
       {/* Main */}
       <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+        {/* Mobile export buttons */}
+        <div className="sm:hidden flex gap-2 mb-2">
+          <button
+            type="button"
+            onClick={handleExportExcel}
+            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+          >
+            <FileSpreadsheet className="w-4 h-4" />
+            Excel (CSV)
+          </button>
+          <button
+            type="button"
+            onClick={handleExportPdf}
+            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+          >
+            <FileText className="w-4 h-4" />
+            PDF
+          </button>
+        </div>
+
         {errorMsg && (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center gap-2">
+          <div className="rounded-xl border border-red-500/40 bg-red-950/60 px-3 py-2 text-sm text-red-100 flex items-center gap-2">
             <AlertCircle className="w-4 h-4" />
             <span>{errorMsg}</span>
           </div>
         )}
 
+        {/* KPI row */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-400 mb-1">Total Value</p>
+              <p className="text-2xl font-semibold">
+                {formatCurrency(overall.totalValue)}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Avg unit value {formatCurrency(overall.avgUnitValue || 0)}
+              </p>
+            </div>
+            <div className="bg-emerald-500/10 p-3 rounded-xl">
+              <DollarSign className="w-6 h-6 text-emerald-400" />
+            </div>
+          </div>
+
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-400 mb-1">Total Quantity</p>
+              <p className="text-2xl font-semibold">{overall.totalQty}</p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Across {overall.categories} categories
+              </p>
+            </div>
+            <div className="bg-blue-500/10 p-3 rounded-xl">
+              <Package className="w-6 h-6 text-blue-400" />
+            </div>
+          </div>
+
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-400 mb-1">
+                Low Stock (&lt; {LOW_STOCK_THRESHOLD})
+              </p>
+              <p className="text-2xl font-semibold">
+                {overall.lowStockCount}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Potential purchase candidates
+              </p>
+            </div>
+            <div className="bg-amber-500/10 p-3 rounded-xl">
+              <Activity className="w-6 h-6 text-amber-400" />
+            </div>
+          </div>
+
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-400 mb-1">
+                Verification Risk (&gt; {VERIFICATION_STALE_DAYS} days)
+              </p>
+              <p className="text-2xl font-semibold">
+                {overall.staleOrNeverVerifiedCount}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Items needing physical check
+              </p>
+            </div>
+            <div className="bg-rose-500/10 p-3 rounded-xl">
+              <Clock className="w-6 h-6 text-rose-400" />
+            </div>
+          </div>
+        </section>
+
+        {/* Management insights row */}
+        <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+          {/* Top categories by value */}
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold text-slate-300">
+                  Top Categories by Value
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  For budgeting & capex focus
+                </p>
+              </div>
+              <TrendingUp className="w-4 h-4 text-slate-400" />
+            </div>
+            {topCategoriesByValue.length === 0 ? (
+              <p className="text-xs text-slate-500">No data.</p>
+            ) : (
+              <div className="space-y-2">
+                {topCategoriesByValue.map((cat) => {
+                  const pct =
+                    overall.totalValue > 0
+                      ? (cat.totalValue / overall.totalValue) * 100
+                      : 0;
+                  return (
+                    <div key={cat.category} className="space-y-1">
+                      <div className="flex justify-between text-[11px] text-slate-400">
+                        <span className="font-medium text-slate-200">
+                          {cat.category}
+                        </span>
+                        <span>{formatCurrency(cat.totalValue)}</span>
+                      </div>
+                      <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-indigo-400 to-sky-400"
+                          style={{ width: `${Math.min(pct, 100)}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* High-value items */}
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold text-slate-300">
+                  Highest Value Items
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  For insurance & critical asset tracking
+                </p>
+              </div>
+              <DollarSign className="w-4 h-4 text-slate-400" />
+            </div>
+            {topItemsByValue.length === 0 ? (
+              <p className="text-xs text-slate-500">No data.</p>
+            ) : (
+              <ul className="space-y-2 text-xs">
+                {topItemsByValue.map((it) => (
+                  <li
+                    key={it.id}
+                    className="flex items-center justify-between border border-slate-800/70 rounded-xl px-3 py-2 hover:bg-slate-800/60 cursor-pointer"
+                    onClick={() => handleOpenItem(it)}
+                  >
+                    <div className="flex flex-col">
+                      <span className="font-medium text-slate-100">
+                        {it.name}
+                      </span>
+                      <span className="text-[11px] text-slate-500">
+                        {it.category || "Uncategorized"} • Qty {it.quantity}
+                      </span>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-sm font-semibold text-slate-50">
+                        {formatCurrency(
+                          (it.purchase_price || 0) * it.quantity
+                        )}
+                      </p>
+                      <p className="text-[11px] text-slate-500">
+                        {formatCurrency(it.purchase_price || 0)} / unit
+                      </p>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          {/* Risk & action list */}
+          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold text-slate-300">
+                  Action List
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  Low stock & verification risk
+                </p>
+              </div>
+              <Activity className="w-4 h-4 text-slate-400" />
+            </div>
+
+            <div className="space-y-2">
+              <p className="text-[11px] text-slate-400 font-semibold">
+                Low Stock (Reorder)
+              </p>
+              {lowStockItems.length === 0 ? (
+                <p className="text-[11px] text-slate-500">
+                  No low stock items.
+                </p>
+              ) : (
+                <ul className="space-y-1 text-xs">
+                  {lowStockItems.map((it) => (
+                    <li
+                      key={it.id}
+                      className="flex justify-between items-center px-2 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800/80 cursor-pointer"
+                      onClick={() => handleOpenItem(it)}
+                    >
+                      <span className="truncate max-w-[60%]">
+                        {it.name}
+                      </span>
+                      <span className="text-[11px] text-amber-300">
+                        Qty {it.quantity}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="space-y-2 pt-2 border-t border-slate-800/60">
+              <p className="text-[11px] text-slate-400 font-semibold">
+                Verification Overdue
+              </p>
+              {staleVerificationItems.length === 0 ? (
+                <p className="text-[11px] text-slate-500">
+                  All items recently verified or no items.
+                </p>
+              ) : (
+                <ul className="space-y-1 text-xs">
+                  {staleVerificationItems.map((it) => {
+                    const lv = lastVerifications[it.id];
+                    const badge = lv
+                      ? `${daysSince(lv.verified_at)} days`
+                      : "Never";
+                    return (
+                      <li
+                        key={it.id}
+                        className="flex justify-between items-center px-2 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800/80 cursor-pointer"
+                        onClick={() => handleOpenItem(it)}
+                      >
+                        <span className="truncate max-w-[60%]">
+                          {it.name}
+                        </span>
+                        <span className="text-[11px] text-rose-300">
+                          {badge}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          </div>
+        </section>
+
         {/* Filters */}
-        <section className="bg-white border rounded-xl p-4 shadow-sm flex flex-wrap gap-4 items-end">
+        <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 shadow-sm flex flex-wrap gap-4 items-end">
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-600 mb-1">
+            <label className="text-xs font-medium text-slate-300 mb-1">
               Category
             </label>
             <select
               value={filterCategory}
               onChange={(e) => setFilterCategory(e.target.value)}
-              className="px-3 py-1.5 border rounded-lg text-sm"
+              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
             >
               <option value="all">All</option>
               {categoryOptions.map((cat) => (
@@ -411,13 +994,13 @@ export default function ReportsPage() {
           </div>
 
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-600 mb-1">
+            <label className="text-xs font-medium text-slate-300 mb-1">
               Location
             </label>
             <select
               value={filterLocation}
               onChange={(e) => setFilterLocation(e.target.value)}
-              className="px-3 py-1.5 border rounded-lg text-sm"
+              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
             >
               <option value="all">All</option>
               {locationOptions.map((loc) => (
@@ -429,13 +1012,13 @@ export default function ReportsPage() {
           </div>
 
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-600 mb-1">
+            <label className="text-xs font-medium text-slate-300 mb-1">
               Type
             </label>
             <select
               value={filterType}
               onChange={(e) => setFilterType(e.target.value)}
-              className="px-3 py-1.5 border rounded-lg text-sm"
+              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
             >
               <option value="all">All</option>
               {typeOptions.map((t) => (
@@ -446,8 +1029,8 @@ export default function ReportsPage() {
             </select>
           </div>
 
-          <div className="flex flex-col flex-1 min-w-[160px]">
-            <label className="text-xs font-medium text-slate-600 mb-1">
+          <div className="flex flex-col flex-1 min-w-[180px]">
+            <label className="text-xs font-medium text-slate-300 mb-1">
               Search (name or TE#)
             </label>
             <input
@@ -455,86 +1038,44 @@ export default function ReportsPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="e.g. Hilti, TE-045"
-              className="px-3 py-1.5 border rounded-lg text-sm"
+              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100 placeholder:text-slate-500"
             />
-          </div>
-        </section>
-
-        {/* Stats */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="bg-white rounded-xl p-4 shadow-sm border flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-500 mb-1">Total Value</p>
-              <p className="text-2xl font-semibold">
-                {formatCurrency(overall.totalValue)}
-              </p>
-            </div>
-            <div className="bg-emerald-50 p-3 rounded-lg">
-              <DollarSign className="w-6 h-6 text-emerald-600" />
-            </div>
-          </div>
-          <div className="bg-white rounded-xl p-4 shadow-sm border flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-500 mb-1">Total Quantity</p>
-              <p className="text-2xl font-semibold">{overall.totalItems}</p>
-            </div>
-            <div className="bg-blue-50 p-3 rounded-lg">
-              <Package className="w-6 h-6 text-blue-600" />
-            </div>
-          </div>
-          <div className="bg-white rounded-xl p-4 shadow-sm border flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-500 mb-1">Categories</p>
-              <p className="text-2xl font-semibold">{overall.categories}</p>
-            </div>
-            <div className="bg-purple-50 p-3 rounded-lg">
-              <Tag className="w-6 h-6 text-purple-600" />
-            </div>
-          </div>
-          <div className="bg-white rounded-xl p-4 shadow-sm border flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-500 mb-1">Low Stock (&lt; 5)</p>
-              <p className="text-2xl font-semibold">{overall.lowStock}</p>
-            </div>
-            <div className="bg-orange-50 p-3 rounded-lg">
-              <AlertCircle className="w-6 h-6 text-orange-600" />
-            </div>
           </div>
         </section>
 
         {/* Groups by category */}
         <section className="space-y-4">
           {loading ? (
-            <div className="bg-white rounded-xl border shadow-sm p-6 text-center text-slate-500">
-              Loading report...
+            <div className="bg-slate-900/80 rounded-2xl border border-slate-800 shadow-sm p-6 text-center text-slate-400">
+              Building report...
             </div>
           ) : filteredGroups.length === 0 ? (
-            <div className="bg-white rounded-xl border shadow-sm p-6 text-center text-slate-500">
+            <div className="bg-slate-900/80 rounded-2xl border border-slate-800 shadow-sm p-6 text-center text-slate-400">
               No inventory data matches the current filters.
             </div>
           ) : (
             filteredGroups.map((g) => (
               <div
                 key={g.category}
-                className="bg-white rounded-2xl shadow-sm border overflow-hidden"
+                className="bg-slate-900/80 rounded-2xl shadow-sm border border-slate-800 overflow-hidden"
               >
-                <div className="flex items-center justify-between px-4 py-3 border-b bg-slate-50">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-slate-950/70">
                   <div className="flex items-center gap-2">
-                    <Tag className="w-4 h-4 text-purple-500" />
-                    <h2 className="text-sm font-semibold text-slate-800">
+                    <Tag className="w-4 h-4 text-purple-400" />
+                    <h2 className="text-sm font-semibold text-slate-50">
                       {g.category}
                     </h2>
                   </div>
-                  <div className="flex items-center gap-4 text-xs text-slate-500">
+                  <div className="flex items-center gap-4 text-xs text-slate-400">
                     <span>
                       Qty:{" "}
-                      <span className="font-semibold text-slate-800">
+                      <span className="font-semibold text-slate-50">
                         {g.totalQty}
                       </span>
                     </span>
                     <span>
                       Value:{" "}
-                      <span className="font-semibold text-slate-800">
+                      <span className="font-semibold text-slate-50">
                         {formatCurrency(g.totalValue)}
                       </span>
                     </span>
@@ -543,8 +1084,8 @@ export default function ReportsPage() {
 
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
-                    <thead className="bg-white border-b">
-                      <tr className="text-left text-[11px] text-slate-500">
+                    <thead className="bg-slate-950 border-b border-slate-800">
+                      <tr className="text-left text-[11px] text-slate-400">
                         <th className="px-3 py-2">Item</th>
                         <th className="px-3 py-2">Type</th>
                         <th className="px-3 py-2">Location</th>
@@ -564,42 +1105,42 @@ export default function ReportsPage() {
                           <tr
                             key={it.id}
                             onClick={() => handleOpenItem(it)}
-                            className="border-b last:border-0 hover:bg-slate-50 cursor-pointer"
+                            className="border-b border-slate-800 last:border-0 hover:bg-slate-800/60 cursor-pointer"
                           >
                             <td className="px-3 py-2 align-top">
                               <div className="flex flex-col gap-0.5">
-                                <span className="font-medium text-slate-900">
+                                <span className="font-medium text-slate-50">
                                   {it.name}
                                 </span>
-                                <span className="text-[11px] text-slate-500">
+                                <span className="text-[11px] text-slate-400">
                                   {lastVerText}
                                 </span>
                                 {it.description && (
-                                  <span className="text-[11px] text-slate-400 line-clamp-1">
+                                  <span className="text-[11px] text-slate-500 line-clamp-1">
                                     {it.description}
                                   </span>
                                 )}
                               </div>
                             </td>
-                            <td className="px-3 py-2 align-top text-[11px] text-slate-600">
+                            <td className="px-3 py-2 align-top text-[11px] text-slate-300">
                               {it.type || "Unspecified"}
                             </td>
                             <td className="px-3 py-2 align-top">
-                              <div className="inline-flex items-center gap-1 text-slate-600">
+                              <div className="inline-flex items-center gap-1 text-slate-300">
                                 <MapPin className="w-3 h-3" />
                                 <span>{it.location || "-"}</span>
                               </div>
                             </td>
-                            <td className="px-3 py-2 align-top text-[11px] text-slate-500">
+                            <td className="px-3 py-2 align-top text-[11px] text-slate-400">
                               {it.te_number || "-"}
                             </td>
-                            <td className="px-3 py-2 align-top text-right">
+                            <td className="px-3 py-2 align-top text-right text-slate-50">
                               {it.quantity}
                             </td>
-                            <td className="px-3 py-2 align-top text-right">
+                            <td className="px-3 py-2 align-top text-right text-slate-50">
                               {unit ? formatCurrency(unit) : "-"}
                             </td>
-                            <td className="px-3 py-2 align-top text-right font-semibold text-slate-900">
+                            <td className="px-3 py-2 align-top text-right font-semibold text-slate-50">
                               {total ? formatCurrency(total) : "-"}
                             </td>
                           </tr>
@@ -617,19 +1158,19 @@ export default function ReportsPage() {
       {/* Item detail + verification modal */}
       {selectedItem && (
         <div
-          className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
           onClick={() => setSelectedItem(null)}
         >
           <div
-            className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto"
+            className="bg-slate-950 rounded-2xl border border-slate-800 shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between px-5 py-3 border-b bg-white sticky top-0 z-10">
+            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800 bg-slate-950 sticky top-0 z-10">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">
+                <h2 className="text-sm font-semibold text-slate-50">
                   {selectedItem.name}
                 </h2>
-                <p className="text-[11px] text-slate-500">
+                <p className="text-[11px] text-slate-400">
                   TE#: {selectedItem.te_number || "-"}
                 </p>
                 <p className="text-[11px] text-slate-500">
@@ -638,9 +1179,9 @@ export default function ReportsPage() {
               </div>
               <button
                 onClick={() => setSelectedItem(null)}
-                className="p-2 rounded-lg hover:bg-slate-100"
+                className="p-2 rounded-lg hover:bg-slate-800"
               >
-                <X className="w-4 h-4 text-slate-600" />
+                <X className="w-4 h-4 text-slate-300" />
               </button>
             </div>
 
@@ -648,10 +1189,10 @@ export default function ReportsPage() {
               {/* Photos */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <p className="text-[11px] font-semibold text-slate-500 mb-1 uppercase">
+                  <p className="text-[11px] font-semibold text-slate-400 mb-1 uppercase">
                     Primary Photo
                   </p>
-                  <div className="aspect-square rounded-xl border bg-slate-50 overflow-hidden flex items-center justify-center">
+                  <div className="aspect-square rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex items-center justify-center">
                     {selectedItem.image_url ? (
                       <img
                         src={selectedItem.image_url}
@@ -659,15 +1200,15 @@ export default function ReportsPage() {
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <FileImage className="w-10 h-10 text-slate-300" />
+                      <FileImage className="w-10 h-10 text-slate-600" />
                     )}
                   </div>
                 </div>
                 <div>
-                  <p className="text-[11px] font-semibold text-slate-500 mb-1 uppercase">
+                  <p className="text-[11px] font-semibold text-slate-400 mb-1 uppercase">
                     Secondary Photo
                   </p>
-                  <div className="aspect-square rounded-xl border bg-slate-50 overflow-hidden flex items-center justify-center">
+                  <div className="aspect-square rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex items-center justify-center">
                     {selectedItem.image_url_2 ? (
                       <img
                         src={selectedItem.image_url_2}
@@ -675,19 +1216,19 @@ export default function ReportsPage() {
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <FileImage className="w-10 h-10 text-slate-300" />
+                      <FileImage className="w-10 h-10 text-slate-600" />
                     )}
                   </div>
                 </div>
               </div>
 
               {/* Details */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-slate-50 rounded-xl p-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-slate-900 rounded-xl p-4 border border-slate-800">
                 <div>
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Type
                   </p>
-                  <p className="text-sm font-medium text-slate-900">
+                  <p className="text-sm font-medium text-slate-50">
                     {selectedItem.type || "Unspecified"}
                   </p>
                 </div>
@@ -695,7 +1236,7 @@ export default function ReportsPage() {
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Category
                   </p>
-                  <p className="text-sm font-medium text-slate-900">
+                  <p className="text-sm font-medium text-slate-50">
                     {selectedItem.category || "Uncategorized"}
                   </p>
                 </div>
@@ -703,7 +1244,7 @@ export default function ReportsPage() {
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Location
                   </p>
-                  <p className="text-sm font-medium text-slate-900">
+                  <p className="text-sm font-medium text-slate-50">
                     {selectedItem.location || "-"}
                   </p>
                 </div>
@@ -711,7 +1252,7 @@ export default function ReportsPage() {
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Quantity
                   </p>
-                  <p className="text-lg font-semibold text-slate-900">
+                  <p className="text-lg font-semibold text-slate-50">
                     {selectedItem.quantity}
                   </p>
                 </div>
@@ -719,7 +1260,7 @@ export default function ReportsPage() {
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Unit Price
                   </p>
-                  <p className="text-lg font-semibold text-slate-900">
+                  <p className="text-lg font-semibold text-slate-50">
                     {selectedItem.purchase_price
                       ? formatCurrency(selectedItem.purchase_price)
                       : "$0.00"}
@@ -729,18 +1270,18 @@ export default function ReportsPage() {
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Purchase Date
                   </p>
-                  <p className="text-sm font-medium text-slate-900">
+                  <p className="text-sm font-medium text-slate-50">
                     {selectedItem.purchase_date || "-"}
                   </p>
                 </div>
               </div>
 
               {selectedItem.description && (
-                <div className="bg-white rounded-xl border p-4">
+                <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Description
                   </p>
-                  <p className="text-sm text-slate-800">
+                  <p className="text-sm text-slate-100">
                     {selectedItem.description}
                   </p>
                 </div>
@@ -748,53 +1289,54 @@ export default function ReportsPage() {
 
               {/* Latest verification photo (if any) */}
               {lastVerifications[selectedItem.id]?.photo_url && (
-                <div className="bg-white rounded-xl border p-4">
+                <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Latest Verification Photo
                   </p>
                   <div className="w-full max-w-xs">
                     <img
                       src={
-                        lastVerifications[selectedItem.id]?.photo_url as string
+                        lastVerifications[selectedItem.id]
+                          ?.photo_url as string
                       }
                       alt="Latest verification"
-                      className="w-full h-auto rounded-lg border"
+                      className="w-full h-auto rounded-lg border border-slate-800"
                     />
                   </div>
                 </div>
               )}
 
               {/* Add verification block */}
-              <div className="bg-white rounded-xl border p-4 space-y-3">
+              <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
                 <p className="text-[11px] text-slate-500 mb-1 uppercase">
                   Add Stock Verification
                 </p>
                 {verificationError && (
-                  <div className="text-xs text-red-600 flex items-center gap-1">
+                  <div className="text-xs text-rose-300 flex items-center gap-1">
                     <AlertCircle className="w-3 h-3" />
                     {verificationError}
                   </div>
                 )}
                 {verificationSuccess && (
-                  <div className="text-xs text-emerald-600 flex items-center gap-1">
+                  <div className="text-xs text-emerald-300 flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3" />
                     Verification saved.
                   </div>
                 )}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                   <div>
-                    <label className="block text-slate-600 mb-1">
+                    <label className="block text-slate-300 mb-1">
                       Verification Date
                     </label>
                     <input
                       type="date"
                       value={verDate}
                       onChange={(e) => setVerDate(e.target.value)}
-                      className="w-full px-2 py-1.5 border rounded-lg"
+                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100"
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-600 mb-1">
+                    <label className="block text-slate-300 mb-1">
                       Verified Quantity
                     </label>
                     <input
@@ -805,11 +1347,11 @@ export default function ReportsPage() {
                           e.target.value === "" ? "" : Number(e.target.value)
                         )
                       }
-                      className="w-full px-2 py-1.5 border rounded-lg"
+                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100"
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-600 mb-1">
+                    <label className="block text-slate-300 mb-1">
                       Notes (optional)
                     </label>
                     <input
@@ -817,19 +1359,19 @@ export default function ReportsPage() {
                       value={verNotes}
                       onChange={(e) => setVerNotes(e.target.value)}
                       placeholder="Counted in MER container..."
-                      className="w-full px-2 py-1.5 border rounded-lg"
+                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100 placeholder:text-slate-500"
                     />
                   </div>
                 </div>
 
                 {/* Verification photo upload */}
                 <div className="mt-3 text-xs">
-                  <label className="block text-slate-600 mb-1">
+                  <label className="block text-slate-300 mb-1">
                     Verification Photo (optional)
                   </label>
-                  <label className="inline-flex items-center gap-2 px-3 py-2 border border-dashed rounded-lg cursor-pointer hover:border-slate-400">
-                    <Upload className="w-4 h-4" />
-                    <span>
+                  <label className="inline-flex items-center gap-2 px-3 py-2 border border-dashed border-slate-700 rounded-lg cursor-pointer hover:border-slate-500">
+                    <Upload className="w-4 h-4 text-slate-200" />
+                    <span className="text-slate-100">
                       {verPhotoUrl
                         ? "Change verification photo"
                         : "Upload verification photo"}
@@ -846,7 +1388,7 @@ export default function ReportsPage() {
                       <img
                         src={verPhotoUrl}
                         alt="Verification preview"
-                        className="w-full h-auto rounded-md border"
+                        className="w-full h-auto rounded-md border border-slate-700"
                       />
                     </div>
                   )}
@@ -857,7 +1399,7 @@ export default function ReportsPage() {
                     type="button"
                     onClick={handleAddVerification}
                     disabled={savingVerification}
-                    className="px-4 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-60 flex items-center gap-1"
+                    className="px-4 py-1.5 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-60 flex items-center gap-1"
                   >
                     <CheckCircle2 className="w-3 h-3" />
                     {savingVerification ? "Saving..." : "Save Verification"}
