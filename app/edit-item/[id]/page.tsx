@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, ChangeEvent } from "react";
+import { useEffect, useMemo, useState, ChangeEvent } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -19,15 +19,21 @@ type Item = {
   id: string;
   name: string;
   description: string | null;
+
+  // these are your UI “canonical” fields (what your inputs bind to)
   category: string | null;
   location: string | null;
+  te_number: string | null;
+
   quantity: number;
+
   image_url: string | null;
   image_url_2: string | null;
-  user_id: string | null;
-  te_number: string | null;
+
   purchase_price?: number | null;
   purchase_date?: string | null;
+
+  user_id: string | null;
 };
 
 type Profile = {
@@ -35,6 +41,34 @@ type Profile = {
   role: string;
   display_name: string | null;
 };
+
+/**
+ * The root cause of your problem is almost always one of these:
+ * - DB columns are camelCase (teNumber) but UI expects snake_case (te_number)
+ * - DB columns are named differently (unit_price vs purchase_price)
+ * - DB uses foreign keys (category_id / location_id) but UI uses text fields
+ *
+ * So we:
+ * 1) detect which keys exist on the row returned by Supabase
+ * 2) normalize into our UI-friendly Item shape
+ * 3) on save, update using the detected keys (so it persists correctly)
+ */
+type ItemKeyMap = {
+  categoryKey: string;
+  locationKey: string;
+  teKey: string;
+  priceKey: string;
+  dateKey: string;
+  image1Key: string;
+  image2Key: string;
+};
+
+function pickExistingKey(row: Record<string, any>, candidates: string[], fallback: string) {
+  for (const k of candidates) {
+    if (Object.prototype.hasOwnProperty.call(row, k)) return k;
+  }
+  return fallback;
+}
 
 export default function EditItemPage() {
   const router = useRouter();
@@ -44,6 +78,8 @@ export default function EditItemPage() {
   const [item, setItem] = useState<Item | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+
+  const [keyMap, setKeyMap] = useState<ItemKeyMap | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -57,9 +93,7 @@ export default function EditItemPage() {
       setErrorMsg(null);
 
       const { data: userData, error: authError } = await supabase.auth.getUser();
-      if (authError) {
-        console.error("Auth error:", authError);
-      }
+      if (authError) console.error("Auth error:", authError);
 
       if (!userData?.user) {
         router.push("/auth");
@@ -76,9 +110,7 @@ export default function EditItemPage() {
         .eq("id", uid)
         .maybeSingle();
 
-      if (profError) {
-        console.error("Profile load error:", profError);
-      }
+      if (profError) console.error("Profile load error:", profError);
 
       if (prof) {
         setProfile({
@@ -103,13 +135,52 @@ export default function EditItemPage() {
         return;
       }
 
-      setItem(itemData as Item);
+      const row = itemData as Record<string, any>;
+
+      // Detect DB key names from the row that came back
+      const detectedKeyMap: ItemKeyMap = {
+        categoryKey: pickExistingKey(row, ["category", "category_name", "category_id"], "category"),
+        locationKey: pickExistingKey(row, ["location", "location_name", "location_id"], "location"),
+        teKey: pickExistingKey(row, ["te_number", "teNumber", "te_no", "teNo"], "te_number"),
+        priceKey: pickExistingKey(row, ["purchase_price", "unit_price", "price", "unitPrice"], "purchase_price"),
+        dateKey: pickExistingKey(row, ["purchase_date", "purchaseDate", "date_purchased"], "purchase_date"),
+        image1Key: pickExistingKey(row, ["image_url", "imageUrl"], "image_url"),
+        image2Key: pickExistingKey(row, ["image_url_2", "imageUrl2", "image_url2"], "image_url_2"),
+      };
+
+      setKeyMap(detectedKeyMap);
+
+      // Normalize row into UI shape
+      const normalized: Item = {
+        id: String(row.id),
+        name: row.name ?? "",
+        description: row.description ?? null,
+
+        // IMPORTANT: if your DB stores IDs (category_id/location_id), this will show the ID.
+        // For human-readable names, you should switch to a join later (categories/locations tables).
+        category: row[detectedKeyMap.categoryKey] ?? null,
+        location: row[detectedKeyMap.locationKey] ?? null,
+        te_number: row[detectedKeyMap.teKey] ?? null,
+
+        quantity: Number(row.quantity ?? 0),
+
+        image_url: row[detectedKeyMap.image1Key] ?? null,
+        image_url_2: row[detectedKeyMap.image2Key] ?? null,
+
+        purchase_price:
+          row[detectedKeyMap.priceKey] === "" || row[detectedKeyMap.priceKey] == null
+            ? null
+            : Number(row[detectedKeyMap.priceKey]),
+        purchase_date: row[detectedKeyMap.dateKey] ?? null,
+
+        user_id: row.user_id ?? null,
+      };
+
+      setItem(normalized);
       setLoading(false);
     };
 
-    if (itemId) {
-      void init();
-    }
+    if (itemId) void init();
   }, [itemId, router]);
 
   const handleChange = (field: keyof Item, value: any) => {
@@ -118,31 +189,36 @@ export default function EditItemPage() {
   };
 
   const handleSave = async () => {
-    if (!item) return;
+    if (!item || !keyMap) return;
 
     setSaving(true);
     setErrorMsg(null);
     setInfoMsg(null);
 
-    const { error } = await supabase
-      .from("items")
-      .update({
-        name: item.name,
-        description: item.description,
-        category: item.category,
-        location: item.location,
-        quantity: item.quantity,
-        te_number: item.te_number,
-        image_url: item.image_url,
-        image_url_2: item.image_url_2,
-        purchase_price: item.purchase_price,
-        purchase_date: item.purchase_date,
-      })
-      .eq("id", item.id);
+    // Build payload using detected DB keys (so it persists regardless of schema naming)
+    const payload: Record<string, any> = {
+      name: item.name,
+      description: item.description,
+      quantity: item.quantity,
+      // always include user_id only if you want to enforce ownership; otherwise omit
+      // user_id: item.user_id,
+    };
+
+    payload[keyMap.categoryKey] = item.category;
+    payload[keyMap.locationKey] = item.location;
+    payload[keyMap.teKey] = item.te_number;
+
+    payload[keyMap.image1Key] = item.image_url;
+    payload[keyMap.image2Key] = item.image_url_2;
+
+    payload[keyMap.priceKey] = item.purchase_price ?? null;
+    payload[keyMap.dateKey] = item.purchase_date ?? null;
+
+    const { error } = await supabase.from("items").update(payload).eq("id", item.id);
 
     if (error) {
       console.error(error);
-      setErrorMsg("Error saving item.");
+      setErrorMsg(`Error saving item. ${error.message ?? ""}`.trim());
     } else {
       setInfoMsg("Item updated.");
     }
@@ -166,7 +242,7 @@ export default function EditItemPage() {
 
     if (error) {
       console.error(error);
-      setErrorMsg("Error deleting item.");
+      setErrorMsg(`Error deleting item. ${error.message ?? ""}`.trim());
       setDeleting(false);
       return;
     }
@@ -183,6 +259,8 @@ export default function EditItemPage() {
     if (!file || !userId || !item) return;
 
     try {
+      setErrorMsg(null);
+
       const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
       const fileName = `${Date.now()}-${which}.${ext}`;
       const path = `${userId}/items/${fileName}`;
@@ -205,6 +283,9 @@ export default function EditItemPage() {
       } else {
         setItem({ ...item, image_url_2: url });
       }
+
+      // allow uploading same file again by resetting input
+      e.target.value = "";
     } catch (err) {
       console.error(err);
       setErrorMsg("Unexpected error while uploading image.");
@@ -213,11 +294,8 @@ export default function EditItemPage() {
 
   const clearImage = (which: "primary" | "secondary") => {
     if (!item) return;
-    if (which === "primary") {
-      setItem({ ...item, image_url: null });
-    } else {
-      setItem({ ...item, image_url_2: null });
-    }
+    if (which === "primary") setItem({ ...item, image_url: null });
+    else setItem({ ...item, image_url_2: null });
   };
 
   if (loading) {
@@ -291,6 +369,7 @@ export default function EditItemPage() {
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 TE Number
@@ -302,6 +381,7 @@ export default function EditItemPage() {
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 Category
@@ -313,6 +393,7 @@ export default function EditItemPage() {
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 Location
@@ -324,6 +405,7 @@ export default function EditItemPage() {
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 Quantity
@@ -331,12 +413,11 @@ export default function EditItemPage() {
               <input
                 type="number"
                 value={item.quantity}
-                onChange={(e) =>
-                  handleChange("quantity", Number(e.target.value || 0))
-                }
+                onChange={(e) => handleChange("quantity", Number(e.target.value || 0))}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 Unit Price
@@ -354,6 +435,7 @@ export default function EditItemPage() {
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
+
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
                 Purchase Date
@@ -362,10 +444,7 @@ export default function EditItemPage() {
                 type="date"
                 value={item.purchase_date || ""}
                 onChange={(e) =>
-                  handleChange(
-                    "purchase_date",
-                    e.target.value === "" ? null : e.target.value
-                  )
+                  handleChange("purchase_date", e.target.value === "" ? null : e.target.value)
                 }
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
@@ -384,7 +463,7 @@ export default function EditItemPage() {
             />
           </div>
 
-          {/* Photos section with preview + upload + delete */}
+          {/* Photos section */}
           <section className="space-y-3">
             <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">
               Photos
@@ -485,9 +564,8 @@ export default function EditItemPage() {
               </div>
             </div>
             <p className="text-[10px] text-slate-400">
-              Note: Removing a photo here will clear it from the item record
-              when you save. Files remain in storage but are no longer linked
-              to this item.
+              Note: Removing a photo here will clear it from the item record when you save.
+              Files remain in storage but are no longer linked to this item.
             </p>
           </section>
 
@@ -499,11 +577,7 @@ export default function EditItemPage() {
               disabled={saving || deleting}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
             >
-              {saving ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Save className="w-4 h-4" />
-              )}
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               {saving ? "Saving..." : "Save changes"}
             </button>
 
@@ -514,11 +588,7 @@ export default function EditItemPage() {
                 disabled={deleting}
                 className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-60"
               >
-                {deleting ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Trash2 className="w-4 h-4" />
-                )}
+                {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
                 {deleting ? "Deleting..." : "Delete item"}
               </button>
             )}
