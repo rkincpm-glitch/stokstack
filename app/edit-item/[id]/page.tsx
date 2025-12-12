@@ -1,10 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, ChangeEvent } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
-import { ArrowLeft, Save, Trash2, AlertCircle, Loader2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Save,
+  Trash2,
+  AlertCircle,
+  Loader2,
+  Upload,
+  Image as ImageIcon,
+  X,
+} from "lucide-react";
 
 type Item = {
   id: string;
@@ -34,6 +43,8 @@ export default function EditItemPage() {
 
   const [item, setItem] = useState<Item | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -45,20 +56,29 @@ export default function EditItemPage() {
       setLoading(true);
       setErrorMsg(null);
 
-      const { data: userData } = await supabase.auth.getUser();
+      const { data: userData, error: authError } = await supabase.auth.getUser();
+      if (authError) {
+        console.error("Auth error:", authError);
+      }
+
       if (!userData?.user) {
         router.push("/auth");
         return;
       }
 
-      const userId = userData.user.id;
+      const uid = userData.user.id;
+      setUserId(uid);
 
       // Load profile
-      const { data: prof } = await supabase
+      const { data: prof, error: profError } = await supabase
         .from("profiles")
         .select("id, role, display_name")
-        .eq("id", userId)
+        .eq("id", uid)
         .maybeSingle();
+
+      if (profError) {
+        console.error("Profile load error:", profError);
+      }
 
       if (prof) {
         setProfile({
@@ -88,7 +108,7 @@ export default function EditItemPage() {
     };
 
     if (itemId) {
-      init();
+      void init();
     }
   }, [itemId, router]);
 
@@ -151,8 +171,53 @@ export default function EditItemPage() {
       return;
     }
 
-    // Optionally: also clean up related stock_verifications, links, etc.
     router.push("/");
+  };
+
+  // Upload a new image for primary/secondary and update state
+  const handleImageFileChange = async (
+    e: ChangeEvent<HTMLInputElement>,
+    which: "primary" | "secondary"
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file || !userId || !item) return;
+
+    try {
+      const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
+      const fileName = `${Date.now()}-${which}.${ext}`;
+      const path = `${userId}/items/${fileName}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from("item-images")
+        .upload(path, file, { upsert: false });
+
+      if (uploadError) {
+        console.error(uploadError);
+        setErrorMsg("Error uploading image. Please try again.");
+        return;
+      }
+
+      const { data } = supabase.storage.from("item-images").getPublicUrl(path);
+      const url = data.publicUrl;
+
+      if (which === "primary") {
+        setItem({ ...item, image_url: url });
+      } else {
+        setItem({ ...item, image_url_2: url });
+      }
+    } catch (err) {
+      console.error(err);
+      setErrorMsg("Unexpected error while uploading image.");
+    }
+  };
+
+  const clearImage = (which: "primary" | "secondary") => {
+    if (!item) return;
+    if (which === "primary") {
+      setItem({ ...item, image_url: null });
+    } else {
+      setItem({ ...item, image_url_2: null });
+    }
   };
 
   if (loading) {
@@ -212,7 +277,7 @@ export default function EditItemPage() {
           </div>
         )}
 
-        <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
+        <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-6">
           {/* Basic fields */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
@@ -319,31 +384,112 @@ export default function EditItemPage() {
             />
           </div>
 
-          {/* Image URLs - keep simple text fields */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Primary Image URL
-              </label>
-              <input
-                type="text"
-                value={item.image_url || ""}
-                onChange={(e) => handleChange("image_url", e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
+          {/* Photos section with preview + upload + delete */}
+          <section className="space-y-3">
+            <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">
+              Photos
+            </h2>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Primary photo */}
+              <div>
+                <p className="text-xs font-medium text-slate-600 mb-1">
+                  Primary Photo
+                </p>
+                <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
+                  {item.image_url ? (
+                    <div className="w-full relative group">
+                      <img
+                        src={item.image_url}
+                        alt={item.name}
+                        className="w-full h-40 object-cover rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          clearImage("primary");
+                        }}
+                        className="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-2 text-slate-400">
+                      <ImageIcon className="w-8 h-8" />
+                      <p className="text-xs text-center">
+                        Click to upload primary photo
+                      </p>
+                    </div>
+                  )}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => handleImageFileChange(e, "primary")}
+                  />
+                </label>
+                {item.image_url && (
+                  <p className="mt-1 text-[10px] text-slate-400 break-all">
+                    {item.image_url}
+                  </p>
+                )}
+              </div>
+
+              {/* Secondary photo */}
+              <div>
+                <p className="text-xs font-medium text-slate-600 mb-1">
+                  Secondary Photo
+                </p>
+                <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
+                  {item.image_url_2 ? (
+                    <div className="w-full relative group">
+                      <img
+                        src={item.image_url_2}
+                        alt={`${item.name} secondary`}
+                        className="w-full h-40 object-cover rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          clearImage("secondary");
+                        }}
+                        className="absolute top-2 right-2 bg-red-500 text-white rounded-full p-1 opacity-0 group-hover:opacity-100 transition"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-2 text-slate-400">
+                      <Upload className="w-8 h-8" />
+                      <p className="text-xs text-center">
+                        Click to upload secondary photo
+                      </p>
+                    </div>
+                  )}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => handleImageFileChange(e, "secondary")}
+                  />
+                </label>
+                {item.image_url_2 && (
+                  <p className="mt-1 text-[10px] text-slate-400 break-all">
+                    {item.image_url_2}
+                  </p>
+                )}
+              </div>
             </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Secondary Image URL
-              </label>
-              <input
-                type="text"
-                value={item.image_url_2 || ""}
-                onChange={(e) => handleChange("image_url_2", e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
-            </div>
-          </div>
+            <p className="text-[10px] text-slate-400">
+              Note: Removing a photo here will clear it from the item record
+              when you save. Files remain in storage but are no longer linked
+              to this item.
+            </p>
+          </section>
 
           {/* Actions */}
           <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t">
