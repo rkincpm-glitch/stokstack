@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, ChangeEvent, FormEvent } from "react";
+import { useEffect, useMemo, useState, ChangeEvent, FormEvent } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -34,22 +34,38 @@ type ItemRow = {
   id: string;
   name: string;
   description: string | null;
-  category: string | null; // stored as TEXT name
-  location: string | null; // stored as TEXT name
-  type: string | null; // stored as TEXT name
+  category: string | null;
+  location: string | null;
+  type: string | null;
   quantity: number | null;
   image_url: string | null;
   image_url_2: string | null;
   te_number: string | null;
   purchase_price: number | string | null;
-  purchase_date: string | null; // YYYY-MM-DD
+  purchase_date: string | null;
   user_id: string | null;
 };
+
+function coerceParam(v: unknown): string | null {
+  if (!v) return null;
+  if (Array.isArray(v)) return typeof v[0] === "string" ? v[0] : null;
+  return typeof v === "string" ? v : null;
+}
 
 export default function EditItemPage() {
   const router = useRouter();
   const params = useParams();
-  const itemId = params?.id as string;
+
+  // ✅ Robustly read the dynamic route param, regardless of folder naming
+  const itemId = useMemo(() => {
+    const p: any = params || {};
+    return (
+      coerceParam(p.id) ||
+      coerceParam(p.itemId) ||
+      coerceParam(p.item_id) ||
+      null
+    );
+  }, [params]);
 
   const [profile, setProfile] = useState<Profile | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -82,7 +98,6 @@ export default function EditItemPage() {
   const setField = (key: keyof typeof form, value: any) =>
     setForm((p) => ({ ...p, [key]: value }));
 
-  // Insert new master record (same behavior as Add page)
   const addMasterItem = async (
     table: "categories" | "locations" | "item_types",
     name: string
@@ -97,7 +112,7 @@ export default function EditItemPage() {
 
     if (error || !data) {
       console.error(error);
-      setErrorMsg(`Failed to add ${table}.`);
+      setErrorMsg(`Failed to add ${table}: ${error?.message ?? ""}`.trim());
       return null;
     }
 
@@ -147,6 +162,16 @@ export default function EditItemPage() {
     const init = async () => {
       setLoading(true);
       setErrorMsg(null);
+      setInfoMsg(null);
+
+      // ✅ Stop infinite loading if route param is missing
+      if (!itemId) {
+        setErrorMsg(
+          "Item ID is missing from the URL. Check your route folder name and param (e.g. [id] vs [itemId])."
+        );
+        setLoading(false);
+        return;
+      }
 
       const { data: userData, error: authError } = await supabase.auth.getUser();
       if (authError) console.error("Auth error:", authError);
@@ -155,6 +180,7 @@ export default function EditItemPage() {
         router.replace("/auth");
         return;
       }
+
       const uid = userData.user.id;
       setUserId(uid);
 
@@ -164,7 +190,6 @@ export default function EditItemPage() {
         .select("id, role, display_name")
         .eq("id", uid)
         .maybeSingle();
-
       if (profError) console.error("Profile load error:", profError);
 
       if (prof) {
@@ -175,7 +200,7 @@ export default function EditItemPage() {
         });
       }
 
-      // load masters (shared, no user_id filter)
+      // masters
       const [cats, locs, types] = await Promise.all([
         supabase.from("categories").select("id, name").order("name"),
         supabase.from("locations").select("id, name").order("name"),
@@ -186,7 +211,7 @@ export default function EditItemPage() {
       if (!locs.error && locs.data) setLocations(locs.data as Location[]);
       if (!types.error && types.data) setItemTypes(types.data as ItemType[]);
 
-      // load item (explicit column list)
+      // item
       const { data: itemData, error: itemError } = await supabase
         .from("items")
         .select(
@@ -197,13 +222,12 @@ export default function EditItemPage() {
 
       if (itemError || !itemData) {
         console.error(itemError);
-        setErrorMsg("Item could not be found.");
+        setErrorMsg(`Item could not be found. ${itemError?.message ?? ""}`.trim());
         setLoading(false);
         return;
       }
 
       const row = itemData as ItemRow;
-
       const normalizedPrice =
         row.purchase_price === null || row.purchase_price === ""
           ? ""
@@ -228,7 +252,7 @@ export default function EditItemPage() {
       setLoading(false);
     };
 
-    if (itemId) void init();
+    void init();
   }, [itemId, router]);
 
   const isFormValid =
@@ -243,13 +267,19 @@ export default function EditItemPage() {
     setErrorMsg(null);
     setInfoMsg(null);
 
-    // REQUIRED enforcement (Category + Location). TE is optional.
-    if (!form.category || !form.category.trim()) {
+    if (!itemId) {
+      setErrorMsg("Missing item id.");
+      setSaving(false);
+      return;
+    }
+
+    // Enforce Category + Location (TE optional)
+    if (!form.category.trim()) {
       setErrorMsg("Category is required before saving.");
       setSaving(false);
       return;
     }
-    if (!form.location || !form.location.trim()) {
+    if (!form.location.trim()) {
       setErrorMsg("Location is required before saving.");
       setSaving(false);
       return;
@@ -257,11 +287,11 @@ export default function EditItemPage() {
 
     const payload = {
       name: form.name.trim(),
-      te_number: form.te_number.trim() || null, // optional
+      te_number: form.te_number.trim() || null,
       description: form.description.trim() || null,
       type: form.type.trim() || null,
-      category: form.category.trim(), // REQUIRED
-      location: form.location.trim(), // REQUIRED
+      category: form.category.trim(),
+      location: form.location.trim(),
       quantity: Number(form.quantity || 0),
       image_url: form.image_url,
       image_url_2: form.image_url_2,
@@ -283,6 +313,7 @@ export default function EditItemPage() {
 
   const handleDelete = async () => {
     if (profile?.role !== "admin") return;
+    if (!itemId) return;
 
     const confirmed = window.confirm(
       `Are you sure you want to permanently delete "${form.name}"? This cannot be undone.`
@@ -313,8 +344,6 @@ export default function EditItemPage() {
     if (!file || !userId) return;
 
     try {
-      setErrorMsg(null);
-
       const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
       const fileName = `${Date.now()}-${which}.${ext}`;
       const path = `${userId}/items/${fileName}`;
@@ -351,6 +380,28 @@ export default function EditItemPage() {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading item...
+      </div>
+    );
+  }
+
+  if (errorMsg && !itemId) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center text-slate-700 px-6">
+        <div className="max-w-xl w-full bg-white border rounded-2xl p-5">
+          <div className="flex items-start gap-2 text-red-700">
+            <AlertCircle className="w-5 h-5 mt-0.5" />
+            <div>
+              <p className="font-semibold">Cannot open item</p>
+              <p className="text-sm mt-1">{errorMsg}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => router.push("/")}
+            className="mt-4 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
+          >
+            Back to dashboard
+          </button>
+        </div>
       </div>
     );
   }
@@ -410,7 +461,6 @@ export default function EditItemPage() {
               />
             </div>
 
-            {/* Type (optional) */}
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">Type</label>
               <select
@@ -428,7 +478,6 @@ export default function EditItemPage() {
               </select>
             </div>
 
-            {/* Category (required) */}
             <div>
               <div className="flex justify-between items-center mb-1">
                 <label className="block text-xs font-medium text-slate-600">
@@ -460,7 +509,6 @@ export default function EditItemPage() {
               )}
             </div>
 
-            {/* Location (required) */}
             <div className="sm:col-span-2">
               <div className="flex justify-between items-center mb-1">
                 <label className="block text-xs font-medium text-slate-600">
@@ -491,39 +539,6 @@ export default function EditItemPage() {
                 <p className="mt-1 text-[11px] text-red-600">Location is required.</p>
               )}
             </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Quantity</label>
-              <input
-                type="number"
-                value={form.quantity}
-                onChange={(e) => setField("quantity", Number(e.target.value || 0))}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Unit Price</label>
-              <input
-                type="number"
-                step="0.01"
-                value={form.purchase_price}
-                onChange={(e) =>
-                  setField("purchase_price", e.target.value === "" ? "" : Number(e.target.value))
-                }
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Date</label>
-              <input
-                type="date"
-                value={form.purchase_date}
-                onChange={(e) => setField("purchase_date", e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
-            </div>
           </div>
 
           <div>
@@ -536,7 +551,6 @@ export default function EditItemPage() {
             />
           </div>
 
-          {/* Photos */}
           <section className="space-y-3">
             <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Photos</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -564,12 +578,7 @@ export default function EditItemPage() {
                       <p className="text-xs text-center">Click to upload primary photo</p>
                     </div>
                   )}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => handleImageFileChange(e, "primary")}
-                  />
+                  <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageFileChange(e, "primary")} />
                 </label>
               </div>
 
@@ -578,11 +587,7 @@ export default function EditItemPage() {
                 <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
                   {form.image_url_2 ? (
                     <div className="w-full relative group">
-                      <img
-                        src={form.image_url_2}
-                        alt={`${form.name} secondary`}
-                        className="w-full h-40 object-cover rounded-lg"
-                      />
+                      <img src={form.image_url_2} alt={`${form.name} secondary`} className="w-full h-40 object-cover rounded-lg" />
                       <button
                         type="button"
                         onClick={(e) => {
@@ -601,12 +606,7 @@ export default function EditItemPage() {
                       <p className="text-xs text-center">Click to upload secondary photo</p>
                     </div>
                   )}
-                  <input
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => handleImageFileChange(e, "secondary")}
-                  />
+                  <input type="file" accept="image/*" className="hidden" onChange={(e) => handleImageFileChange(e, "secondary")} />
                 </label>
               </div>
             </div>
