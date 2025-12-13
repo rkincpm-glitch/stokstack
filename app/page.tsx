@@ -99,7 +99,9 @@ export default function Dashboard() {
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
 
   // Category-first browsing
-  const [browseMode, setBrowseMode] = useState<"categories" | "items">("categories");
+  const [browseMode, setBrowseMode] = useState<"categories" | "items">(
+    "categories"
+  );
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
 
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
@@ -140,6 +142,42 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [companyLoading, companyId]);
 
+  // Backward-compatible read: user_locations may or may not have company_id
+  const fetchUserLocationAccess = async (userId: string) => {
+    if (!companyId) return { data: null as any[] | null };
+
+    // Attempt 1: scoped
+    const scoped = await supabase
+      .from("user_locations")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("company_id", companyId);
+
+    if (!scoped.error) return { data: scoped.data || [] };
+
+    // If company_id column doesn't exist, fallback safely
+    const msg = (scoped.error as any)?.message || "";
+    const code = (scoped.error as any)?.code || "";
+    const looksLikeMissingColumn =
+      code === "42703" || msg.toLowerCase().includes("column") || msg.toLowerCase().includes("does not exist");
+
+    if (!looksLikeMissingColumn) {
+      console.error("user_locations scoped query error:", scoped.error);
+      return { data: [] };
+    }
+
+    const fallback = await supabase
+      .from("user_locations")
+      .select("*")
+      .eq("user_id", userId);
+
+    if (fallback.error) {
+      console.error("user_locations fallback query error:", fallback.error);
+      return { data: [] };
+    }
+    return { data: fallback.data || [] };
+  };
+
   const loadData = async () => {
     setLoading(true);
 
@@ -152,8 +190,8 @@ export default function Dashboard() {
     const userId = userData.user.id;
     const email = userData.user.email || null;
 
+    // company must exist for multi-tenant
     if (!companyId) {
-      // company must exist for multi-tenant
       setItems([]);
       setCategoryOptions([]);
       setLocationOptions([]);
@@ -161,7 +199,7 @@ export default function Dashboard() {
       return;
     }
 
-    // 1) Ensure profile
+    // 1) Ensure profile (not company-scoped; it is per-user)
     let { data: profData, error: profError } = await supabase
       .from("profiles")
       .select("id, role, display_name")
@@ -190,17 +228,16 @@ export default function Dashboard() {
     }
 
     // 2) Load locations (company)
-    const { data: locationsData } = await supabase
+    const { data: locationsData, error: locErr } = await supabase
       .from("locations")
       .select("*")
       .eq("company_id", companyId)
       .order("name", { ascending: true });
 
-    // 3) Load this user's location access from user_locations (optional feature)
-    const { data: accessData } = await supabase
-      .from("user_locations")
-      .select("*")
-      .eq("user_id", userId);
+    if (locErr) console.error("Locations error:", locErr);
+
+    // 3) Load this user's location access (optional feature)
+    const { data: accessData } = await fetchUserLocationAccess(userId);
 
     // 4) Determine allowed locations
     let allowedLocations: string[] | "ALL" = "ALL";
@@ -231,11 +268,13 @@ export default function Dashboard() {
     if (itemsError) console.error("Items error:", itemsError);
 
     // 6) Load categories (company)
-    const { data: categoriesData } = await supabase
+    const { data: categoriesData, error: catErr } = await supabase
       .from("categories")
       .select("*")
       .eq("company_id", companyId)
       .order("name", { ascending: true });
+
+    if (catErr) console.error("Categories error:", catErr);
 
     // 7) Apply state
     const allItems = (itemsData || []) as Item[];
@@ -319,7 +358,10 @@ export default function Dashboard() {
 
   // Stats (rearranged; low stock removed)
   const stats = useMemo(() => {
-    const totalValue = items.reduce((sum, i) => sum + (i.purchase_price || 0) * i.quantity, 0);
+    const totalValue = items.reduce(
+      (sum, i) => sum + (i.purchase_price || 0) * i.quantity,
+      0
+    );
     const totalItems = items.reduce((sum, i) => sum + i.quantity, 0);
     const categories = categoryOptions.length;
     return { totalValue, totalItems, categories };
@@ -334,8 +376,10 @@ export default function Dashboard() {
           .toLowerCase()
           .includes(searchTerm.toLowerCase());
 
-      const matchesCategory = filterCategory === "all" || item.category === filterCategory;
-      const matchesLocation = filterLocation === "all" || item.location === filterLocation;
+      const matchesCategory =
+        filterCategory === "all" || item.category === filterCategory;
+      const matchesLocation =
+        filterLocation === "all" || item.location === filterLocation;
 
       // when browsing a category, lock to that category
       const matchesActiveCategory =
@@ -343,9 +387,21 @@ export default function Dashboard() {
           ? true
           : (item.category || "Uncategorized") === activeCategory;
 
-      return matchesSearch && matchesCategory && matchesLocation && matchesActiveCategory;
+      return (
+        matchesSearch &&
+        matchesCategory &&
+        matchesLocation &&
+        matchesActiveCategory
+      );
     });
-  }, [items, searchTerm, filterCategory, filterLocation, browseMode, activeCategory]);
+  }, [
+    items,
+    searchTerm,
+    filterCategory,
+    filterLocation,
+    browseMode,
+    activeCategory,
+  ]);
 
   // Category cards (default mode)
   const categoryCards: CategoryCard[] = useMemo(() => {
@@ -366,50 +422,89 @@ export default function Dashboard() {
       }
     }
 
-    const list = Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-    return list;
+    return Array.from(map.values()).sort((a, b) =>
+      a.name.localeCompare(b.name)
+    );
   }, [items]);
 
-  const isAdmin = (companyRole || profile?.role) === "admin" || (companyRole || profile?.role) === "owner";
+  const isAdmin =
+    (companyRole || profile?.role) === "admin" ||
+    (companyRole || profile?.role) === "owner";
 
   return (
     <div className="min-h-screen bg-slate-50">
       {/* Sidebar */}
       <div className="fixed left-0 top-0 h-full w-16 bg-white border-r border-slate-200 z-40 hidden sm:flex flex-col items-center py-4 gap-3">
-        <Link href="/" className="p-2 rounded-xl hover:bg-slate-100" title="Dashboard">
+        <Link
+          href="/"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Dashboard"
+        >
           <Home className="w-5 h-5 text-slate-700" />
         </Link>
-        <Link href="/add-item" className="p-2 rounded-xl hover:bg-slate-100" title="Add Item">
+        <Link
+          href="/add-item"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Add Item"
+        >
           <Plus className="w-5 h-5 text-slate-700" />
         </Link>
-        <Link href="/reports" className="p-2 rounded-xl hover:bg-slate-100" title="Reports">
+        <Link
+          href="/reports"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Reports"
+        >
           <BarChart3 className="w-5 h-5 text-slate-700" />
         </Link>
-        <Link href="/purchase-requests" className="p-2 rounded-xl hover:bg-slate-100" title="Purchasing">
+        <Link
+          href="/purchase-requests"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Purchasing"
+        >
           <ShoppingCart className="w-5 h-5 text-slate-700" />
         </Link>
 
         <div className="w-8 h-px bg-slate-200 my-1" />
 
-        <Link href="/settings/categories" className="p-2 rounded-xl hover:bg-slate-100" title="Manage Categories">
+        <Link
+          href="/settings/categories"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Manage Categories"
+        >
           <Tag className="w-5 h-5 text-slate-700" />
         </Link>
-        <Link href="/settings/locations" className="p-2 rounded-xl hover:bg-slate-100" title="Manage Locations">
+        <Link
+          href="/settings/locations"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Manage Locations"
+        >
           <MapPinned className="w-5 h-5 text-slate-700" />
         </Link>
-        <Link href="/settings/types" className="p-2 rounded-xl hover:bg-slate-100" title="Manage Types">
+        <Link
+          href="/settings/types"
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Manage Types"
+        >
           <Shapes className="w-5 h-5 text-slate-700" />
         </Link>
 
         <div className="flex-1" />
 
         {isAdmin && (
-          <Link href="/admin/users" className="p-2 rounded-xl hover:bg-slate-100" title="Manage Users">
+          <Link
+            href="/admin/users"
+            className="p-2 rounded-xl hover:bg-slate-100"
+            title="Manage Users"
+          >
             <Users className="w-5 h-5 text-slate-700" />
           </Link>
         )}
 
-        <button onClick={handleLogout} className="p-2 rounded-xl hover:bg-slate-100" title="Logout">
+        <button
+          onClick={handleLogout}
+          className="p-2 rounded-xl hover:bg-slate-100"
+          title="Logout"
+        >
           <LogOut className="w-5 h-5 text-slate-700" />
         </button>
       </div>
@@ -424,12 +519,13 @@ export default function Dashboard() {
               </div>
               <div>
                 <h1 className="text-xl font-bold text-slate-900">stokstak</h1>
-                <p className="text-xs text-slate-500">Inventory & Purchasing</p>
+                <p className="text-xs text-slate-500">
+                  Inventory & Purchasing
+                </p>
               </div>
             </div>
 
             <div className="flex items-center gap-2">
-              {/* Keep existing top buttons (do not remove) */}
               {isAdmin && (
                 <Link
                   href="/admin/users"
@@ -448,7 +544,10 @@ export default function Dashboard() {
                 Add Item
               </Link>
 
-              <button className="p-2 hover:bg-slate-100 rounded-lg transition-colors" title="Settings">
+              <button
+                className="p-2 hover:bg-slate-100 rounded-lg transition-colors"
+                title="Settings"
+              >
                 <Settings className="w-5 h-5 text-slate-600" />
               </button>
 
@@ -466,7 +565,9 @@ export default function Dashboard() {
                 {showUserMenu && (
                   <div className="absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-lg border py-1">
                     <div className="px-4 py-2 text-xs text-slate-500 border-b">
-                      {profile?.display_name ? `Signed in as ${profile.display_name}` : "Signed in"}
+                      {profile?.display_name
+                        ? `Signed in as ${profile.display_name}`
+                        : "Signed in"}
                       {(companyRole || profile?.role) && (
                         <span className="block text-[11px] text-slate-400">
                           Role: {companyRole || profile?.role}
@@ -504,7 +605,8 @@ export default function Dashboard() {
         {/* If company missing */}
         {!companyLoading && !companyId && (
           <div className="bg-white border rounded-xl p-4 text-sm text-slate-700">
-            No company assigned to this user. Please add this user to a company in <code>company_users</code>.
+            No company assigned to this user. Please add this user to a company
+            in <code>company_users</code>.
           </div>
         )}
 
@@ -514,7 +616,9 @@ export default function Dashboard() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-slate-600 mb-1">Total Value</p>
-                <p className="text-2xl font-bold">${stats.totalValue.toFixed(2)}</p>
+                <p className="text-2xl font-bold">
+                  ${stats.totalValue.toFixed(2)}
+                </p>
               </div>
               <div className="bg-green-100 p-3 rounded-lg">
                 <DollarSign className="w-6 h-6 text-green-600" />
@@ -579,7 +683,9 @@ export default function Dashboard() {
                   setFilterCategory("all");
                 }}
                 className={`p-2 rounded flex items-center gap-2 ${
-                  browseMode === "categories" ? "bg-slate-900 text-white" : "hover:bg-slate-100"
+                  browseMode === "categories"
+                    ? "bg-slate-900 text-white"
+                    : "hover:bg-slate-100"
                 }`}
               >
                 <LayoutGrid className="w-4 h-4" />
@@ -593,7 +699,9 @@ export default function Dashboard() {
                   setActiveCategory(null);
                 }}
                 className={`p-2 rounded flex items-center gap-2 ${
-                  browseMode === "items" ? "bg-slate-900 text-white" : "hover:bg-slate-100"
+                  browseMode === "items"
+                    ? "bg-slate-900 text-white"
+                    : "hover:bg-slate-100"
                 }`}
               >
                 <Package className="w-4 h-4" />
@@ -604,19 +712,26 @@ export default function Dashboard() {
             <div className="flex items-center gap-2 border rounded-lg p-1">
               <button
                 onClick={() => setViewMode("grid")}
-                className={`p-2 rounded ${viewMode === "grid" ? "bg-blue-600 text-white" : "hover:bg-slate-100"}`}
+                className={`p-2 rounded ${
+                  viewMode === "grid"
+                    ? "bg-blue-600 text-white"
+                    : "hover:bg-slate-100"
+                }`}
               >
                 <Grid className="w-4 h-4" />
               </button>
               <button
                 onClick={() => setViewMode("list")}
-                className={`p-2 rounded ${viewMode === "list" ? "bg-blue-600 text-white" : "hover:bg-slate-100"}`}
+                className={`p-2 rounded ${
+                  viewMode === "list"
+                    ? "bg-blue-600 text-white"
+                    : "hover:bg-slate-100"
+                }`}
               >
                 <List className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Keep your existing buttons */}
             <Link
               href="/reports"
               className="flex items-center justify-center gap-2 px-4 py-2.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
@@ -639,7 +754,10 @@ export default function Dashboard() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <label className="block text-sm font-medium">Category</label>
-                  <Link href="/settings/categories" className="text-xs text-blue-600 hover:underline">
+                  <Link
+                    href="/settings/categories"
+                    className="text-xs text-blue-600 hover:underline"
+                  >
                     Manage categories
                   </Link>
                 </div>
@@ -660,7 +778,10 @@ export default function Dashboard() {
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <label className="block text-sm font-medium">Location</label>
-                  <Link href="/settings/locations" className="text-xs text-blue-600 hover:underline">
+                  <Link
+                    href="/settings/locations"
+                    className="text-xs text-blue-600 hover:underline"
+                  >
                     Manage locations
                   </Link>
                 </div>
@@ -688,7 +809,9 @@ export default function Dashboard() {
           <div>
             <div className="flex items-center justify-between mb-3">
               <p className="text-sm font-semibold text-slate-900">Categories</p>
-              <p className="text-xs text-slate-500">Click a category to view its items</p>
+              <p className="text-xs text-slate-500">
+                Click a category to view its items
+              </p>
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
@@ -700,13 +823,17 @@ export default function Dashboard() {
                     setBrowseMode("items");
                     setActiveCategory(c.name);
                     setFilterCategory("all"); // category lock is handled by activeCategory
-                    setViewMode((prev) => (prev === "grid" || prev === "list" ? prev : "grid"));
+                    setViewMode((prev) =>
+                      prev === "grid" || prev === "list" ? prev : "grid"
+                    );
                   }}
                   className="text-left bg-white border rounded-2xl shadow-sm hover:shadow-md transition overflow-hidden"
                 >
                   <div className="p-4 flex items-center justify-between">
                     <div>
-                      <p className="font-semibold text-slate-900 line-clamp-1">{c.name}</p>
+                      <p className="font-semibold text-slate-900 line-clamp-1">
+                        {c.name}
+                      </p>
                       <p className="text-xs text-slate-500 mt-1">
                         {c.count} items • {c.totalQty} qty
                       </p>
@@ -721,9 +848,16 @@ export default function Dashboard() {
                     {[0, 1, 2, 3].map((i) => {
                       const url = c.thumbnails[i] || null;
                       return (
-                        <div key={i} className="aspect-square bg-slate-100 rounded-lg overflow-hidden flex items-center justify-center">
+                        <div
+                          key={i}
+                          className="aspect-square bg-slate-100 rounded-lg overflow-hidden flex items-center justify-center"
+                        >
                           {url ? (
-                            <img src={url} alt={`${c.name}-${i}`} className="w-full h-full object-cover" />
+                            <img
+                              src={url}
+                              alt={`${c.name}-${i}`}
+                              className="w-full h-full object-cover"
+                            />
                           ) : (
                             <FileImage className="w-5 h-5 text-slate-300" />
                           )}
@@ -782,14 +916,20 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div className="p-4">
-                      <h3 className="font-semibold mb-1 line-clamp-1">{item.name}</h3>
-                      <p className="text-sm text-slate-600 mb-2 line-clamp-2">{item.description}</p>
+                      <h3 className="font-semibold mb-1 line-clamp-1">
+                        {item.name}
+                      </h3>
+                      <p className="text-sm text-slate-600 mb-2 line-clamp-2">
+                        {item.description}
+                      </p>
                       <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">
                         <Tag className="w-3 h-3" />
                         {item.category || "Uncategorized"}
                       </div>
                       <div className="flex items-center justify-between pt-2 border-t">
-                        <span className="text-xs text-slate-500">{item.te_number}</span>
+                        <span className="text-xs text-slate-500">
+                          {item.te_number}
+                        </span>
                         <span className="text-sm font-semibold">
                           ${item.purchase_price?.toFixed(2) || "0.00"}
                         </span>
@@ -803,12 +943,24 @@ export default function Dashboard() {
                 <table className="w-full">
                   <thead className="bg-slate-50 border-b">
                     <tr>
-                      <th className="text-left p-4 text-sm font-medium">Item</th>
-                      <th className="text-left p-4 text-sm font-medium">TE#</th>
-                      <th className="text-left p-4 text-sm font-medium">Category</th>
-                      <th className="text-left p-4 text-sm font-medium">Location</th>
-                      <th className="text-right p-4 text-sm font-medium">Qty</th>
-                      <th className="text-right p-4 text-sm font-medium">Price</th>
+                      <th className="text-left p-4 text-sm font-medium">
+                        Item
+                      </th>
+                      <th className="text-left p-4 text-sm font-medium">
+                        TE#
+                      </th>
+                      <th className="text-left p-4 text-sm font-medium">
+                        Category
+                      </th>
+                      <th className="text-left p-4 text-sm font-medium">
+                        Location
+                      </th>
+                      <th className="text-right p-4 text-sm font-medium">
+                        Qty
+                      </th>
+                      <th className="text-right p-4 text-sm font-medium">
+                        Price
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -833,7 +985,9 @@ export default function Dashboard() {
                             )}
                             <div>
                               <p className="font-medium">{item.name}</p>
-                              <p className="text-sm text-slate-500 line-clamp-1">{item.description}</p>
+                              <p className="text-sm text-slate-500 line-clamp-1">
+                                {item.description}
+                              </p>
                             </div>
                           </div>
                         </td>
@@ -901,7 +1055,9 @@ export default function Dashboard() {
                       <div className="w-full h-full flex items-center justify-center">
                         <div className="text-center">
                           <FileImage className="w-16 h-16 text-slate-300 mx-auto mb-2" />
-                          <p className="text-xs text-slate-400">No primary photo</p>
+                          <p className="text-xs text-slate-400">
+                            No primary photo
+                          </p>
                         </div>
                       </div>
                     )}
@@ -923,7 +1079,9 @@ export default function Dashboard() {
                       <div className="w-full h-full flex items-center justify-center">
                         <div className="text-center">
                           <FileImage className="w-16 h-16 text-slate-300 mx-auto mb-2" />
-                          <p className="text-xs text-slate-400">No secondary photo</p>
+                          <p className="text-xs text-slate-400">
+                            No secondary photo
+                          </p>
                         </div>
                       </div>
                     )}
@@ -936,7 +1094,9 @@ export default function Dashboard() {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <p className="text-sm text-slate-600 mb-1">Quantity</p>
-                    <p className="text-2xl font-bold">{selectedItem.quantity}</p>
+                    <p className="text-2xl font-bold">
+                      {selectedItem.quantity}
+                    </p>
                   </div>
                   <div>
                     <p className="text-sm text-slate-600 mb-1">Unit Price</p>
@@ -952,7 +1112,9 @@ export default function Dashboard() {
                   <Tag className="w-5 h-5 text-slate-400 flex-shrink-0" />
                   <div>
                     <p className="text-sm text-slate-600">Category</p>
-                    <p className="font-medium">{selectedItem.category || "-"}</p>
+                    <p className="font-medium">
+                      {selectedItem.category || "-"}
+                    </p>
                   </div>
                 </div>
 
@@ -960,7 +1122,9 @@ export default function Dashboard() {
                   <MapPin className="w-5 h-5 text-slate-400 flex-shrink-0" />
                   <div>
                     <p className="text-sm text-slate-600">Location</p>
-                    <p className="font-medium">{selectedItem.location || "-"}</p>
+                    <p className="font-medium">
+                      {selectedItem.location || "-"}
+                    </p>
                   </div>
                 </div>
 
@@ -968,7 +1132,9 @@ export default function Dashboard() {
                   <Package className="w-5 h-5 text-slate-400 flex-shrink-0" />
                   <div>
                     <p className="text-sm text-slate-600">TE Number</p>
-                    <p className="font-medium">{selectedItem.te_number || "-"}</p>
+                    <p className="font-medium">
+                      {selectedItem.te_number || "-"}
+                    </p>
                   </div>
                 </div>
 
@@ -976,7 +1142,9 @@ export default function Dashboard() {
                   <Calendar className="w-5 h-5 text-slate-400 flex-shrink-0" />
                   <div>
                     <p className="text-sm text-slate-600">Purchase Date</p>
-                    <p className="font-medium">{selectedItem.purchase_date || "-"}</p>
+                    <p className="font-medium">
+                      {selectedItem.purchase_date || "-"}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -1017,7 +1185,9 @@ export default function Dashboard() {
                       type="number"
                       value={verifyQty}
                       onChange={(e) =>
-                        setVerifyQty(e.target.value === "" ? "" : Number(e.target.value))
+                        setVerifyQty(
+                          e.target.value === "" ? "" : Number(e.target.value)
+                        )
                       }
                       className="w-full px-3 py-2 border rounded-lg text-sm"
                     />
@@ -1046,9 +1216,13 @@ export default function Dashboard() {
                 </button>
 
                 <div className="mt-4">
-                  <h4 className="text-sm font-semibold mb-2">Verification History</h4>
+                  <h4 className="text-sm font-semibold mb-2">
+                    Verification History
+                  </h4>
                   {loadingVerifications ? (
-                    <p className="text-xs text-slate-500">Loading verification history...</p>
+                    <p className="text-xs text-slate-500">
+                      Loading verification history...
+                    </p>
                   ) : verifications.length === 0 ? (
                     <p className="text-xs text-slate-500">
                       No physical stock verification recorded yet.
@@ -1058,15 +1232,23 @@ export default function Dashboard() {
                       <table className="w-full text-xs">
                         <thead className="bg-slate-50 border-b">
                           <tr>
-                            <th className="text-left px-3 py-2 font-medium">Date</th>
-                            <th className="text-left px-3 py-2 font-medium">Qty</th>
-                            <th className="text-left px-3 py-2 font-medium">Notes</th>
+                            <th className="text-left px-3 py-2 font-medium">
+                              Date
+                            </th>
+                            <th className="text-left px-3 py-2 font-medium">
+                              Qty
+                            </th>
+                            <th className="text-left px-3 py-2 font-medium">
+                              Notes
+                            </th>
                           </tr>
                         </thead>
                         <tbody>
                           {verifications.map((v) => (
                             <tr key={v.id} className="border-b last:border-0">
-                              <td className="px-3 py-2">{v.verified_at?.slice(0, 10)}</td>
+                              <td className="px-3 py-2">
+                                {v.verified_at?.slice(0, 10)}
+                              </td>
                               <td className="px-3 py-2">{v.verified_qty}</td>
                               <td className="px-3 py-2">{v.notes || "-"}</td>
                             </tr>
