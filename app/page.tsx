@@ -1,977 +1,594 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
-import Link from "next/link";
+import { useCompany } from "@/lib/useCompany";
 import {
-  Search,
-  Package,
-  Plus,
+  PlusCircle,
   BarChart3,
-  Grid,
-  List,
-  Filter,
-  AlertCircle,
-  DollarSign,
   Tag,
-  Settings,
-  LogOut,
-  ChevronDown,
+  Package,
+  DollarSign,
+  Grid3X3,
+  List,
+  Search,
   FileImage,
-  MapPin,
-  Calendar,
-  Edit,
-  X,
-  CheckCircle2,
-  Users, // 👈 added
+  ArrowLeft,
 } from "lucide-react";
 
 type Item = {
   id: string;
   name: string;
   description: string | null;
-  category: string | null; // still using text for now
+  type: string | null;
+  category: string | null;
   location: string | null;
   quantity: number;
   image_url: string | null;
   image_url_2: string | null;
-  user_id: string | null;
   te_number: string | null;
-  purchase_price?: number | null;
-  purchase_date?: string | null;
+  purchase_price: number | null;
+  purchase_date: string | null;
 };
 
-type CategoryRow = {
-  id: string;
-  name: string;
-  user_id: string | null;
+type CategorySummary = {
+  category: string;
+  itemCount: number;
+  totalQty: number;
+  totalValue: number;
+  thumbnails: string[]; // up to 6
 };
 
-type LocationRow = {
-  id: string;
-  name: string;
-  user_id: string | null;
-};
+const MAX_CATEGORY_THUMBS = 6;
 
-type StockVerification = {
-  id: string;
-  item_id: string;
-  verified_at: string; // ISO date string
-  verified_qty: number;
-  notes: string | null;
-  verified_by: string | null;
-};
-
-type Profile = {
-  id: string;
-  role: string;
-  display_name: string | null;
-};
-
-export default function Dashboard() {
+export default function DashboardPage() {
   const router = useRouter();
-  const [items, setItems] = useState<Item[]>([]);
+  const { loading: companyLoading, companyId } = useCompany();
+
+  const [userReady, setUserReady] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  const [searchTerm, setSearchTerm] = useState("");
-  const [filterCategory, setFilterCategory] = useState("all");
-  const [filterLocation, setFilterLocation] = useState("all");
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
-  const [selectedItem, setSelectedItem] = useState<Item | null>(null);
-  const [showFilters, setShowFilters] = useState(false);
-  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [items, setItems] = useState<Item[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
-  // Master data for Categories & Locations
-  const [categoryOptions, setCategoryOptions] = useState<string[]>([]);
-  const [locationOptions, setLocationOptions] = useState<string[]>([]);
+  const [search, setSearch] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
-  // Stock verification state
-  const [verifications, setVerifications] = useState<StockVerification[]>([]);
-  const [loadingVerifications, setLoadingVerifications] = useState(false);
-  const [verifyDate, setVerifyDate] = useState("");
-  const [verifyQty, setVerifyQty] = useState<number | "">("");
-  const [verifyNotes, setVerifyNotes] = useState("");
-  const [savingVerification, setSavingVerification] = useState(false);
-
-  // 👇 current user's profile (so we know if they're admin)
-  const [profile, setProfile] = useState<Profile | null>(null);
+  // Mobile default = list; desktop default = categories
+  const [viewMode, setViewMode] = useState<"categories" | "tiles" | "list">(
+    "categories"
+  );
 
   useEffect(() => {
-    loadData();
+    // detect mobile width once on mount
+    if (typeof window !== "undefined") {
+      if (window.innerWidth < 640) setViewMode("list");
+      else setViewMode("categories");
+    }
   }, []);
 
-  // Shared inventory + location-based access + profile
-  const loadData = async () => {
-    setLoading(true);
+  useEffect(() => {
+    async function init() {
+      setError(null);
+      setLoading(true);
 
-    const { data: userData } = await supabase.auth.getUser();
-    if (!userData?.user) {
-      router.push("/auth");
-      return;
+      const { data: userData } = await supabase.auth.getUser();
+      if (!userData?.user) {
+        router.push("/auth");
+        return;
+      }
+      setUserReady(true);
+
+      if (companyLoading) return;
+
+      if (!companyId) {
+        setError("No company assigned to this user.");
+        setLoading(false);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("items")
+        .select(
+          "id,name,description,type,category,location,quantity,image_url,image_url_2,te_number,purchase_price,purchase_date"
+        )
+        .eq("company_id", companyId)
+        .order("category", { ascending: true })
+        .order("name", { ascending: true });
+
+      if (error) {
+        console.error(error);
+        setError("Failed to load inventory.");
+        setItems([]);
+      } else {
+        setItems((data || []) as Item[]);
+      }
+
+      setLoading(false);
     }
 
-    const userId = userData.user.id;
-    const email = userData.user.email || null;
+    void init();
+  }, [router, companyLoading, companyId]);
 
-    // 1) Ensure this user has a profile (role + display name)
-    let { data: profData, error: profError } = await supabase
-      .from("profiles")
-      .select("id, role, display_name")
-      .eq("id", userId)
-      .maybeSingle();
+  const overall = useMemo(() => {
+    const totalValue = items.reduce(
+      (sum, i) => sum + (i.purchase_price || 0) * i.quantity,
+      0
+    );
+    const totalQty = items.reduce((sum, i) => sum + i.quantity, 0);
 
-    if (!profData && !profError) {
-      // create default requester profile
-      const { data: newProf } = await supabase
-        .from("profiles")
-        .insert({
-          id: userId,
-          role: "requester",
-          display_name: email,
-        })
-        .select()
-        .single();
-      profData = newProf;
+    const categories = new Set(
+      items.map((i) => (i.category || "Uncategorized").trim())
+    ).size;
+
+    return { totalValue, totalQty, categories };
+  }, [items]);
+
+  const formatCurrency = (val: number) => `$${val.toFixed(2)}`;
+
+  const filteredItems = useMemo(() => {
+    const term = search.trim().toLowerCase();
+    let list = [...items];
+
+    if (selectedCategory) {
+      list = list.filter(
+        (i) => (i.category || "Uncategorized") === selectedCategory
+      );
     }
 
-    if (profData) {
-      setProfile({
-        id: profData.id,
-        role: profData.role || "requester",
-        display_name: profData.display_name || email,
+    if (term) {
+      list = list.filter((i) => {
+        const hay = `${i.name} ${i.te_number || ""}`.toLowerCase();
+        return hay.includes(term);
       });
     }
 
-    // 2) Load all locations (shared master data)
-    const { data: locationsData, error: locationsError } = await supabase
-      .from("locations")
-      .select("*")
-      .order("name", { ascending: true });
+    return list;
+  }, [items, search, selectedCategory]);
 
-    if (locationsError) {
-      console.error("Locations error:", locationsError);
-    }
+  const categorySummaries = useMemo(() => {
+    const map = new Map<string, CategorySummary>();
 
-    // 3) Load this user's location access from user_locations
-    const { data: accessData, error: accessError } = await supabase
-      .from("user_locations")
-      .select("*")
-      .eq("user_id", userId);
-
-    if (accessError) {
-      console.error("User location access error:", accessError);
-    }
-
-    // 4) Determine allowed locations
-    // - If all_locations = true exists → ALL
-    // - If no rows at all → ALL (default open)
-    // - Else → only items with location in that list
-    let allowedLocations: string[] | "ALL" = "ALL";
-
-    if (accessData && accessData.length > 0) {
-      const hasAll = accessData.some((a: any) => a.all_locations);
-      if (!hasAll) {
-        const locSet = new Set<string>();
-        accessData.forEach((a: any) => {
-          if (a.location_name) locSet.add(a.location_name);
+    for (const it of items) {
+      const cat = (it.category || "Uncategorized").trim();
+      if (!map.has(cat)) {
+        map.set(cat, {
+          category: cat,
+          itemCount: 0,
+          totalQty: 0,
+          totalValue: 0,
+          thumbnails: [],
         });
-        const list = Array.from(locSet);
-        allowedLocations = list.length > 0 ? list : "ALL";
+      }
+      const s = map.get(cat)!;
+      s.itemCount += 1;
+      s.totalQty += it.quantity;
+      s.totalValue += (it.purchase_price || 0) * it.quantity;
+
+      const thumb = it.image_url || it.image_url_2;
+      if (thumb && s.thumbnails.length < MAX_CATEGORY_THUMBS) {
+        s.thumbnails.push(thumb);
       }
     }
 
-    // 5) Load items based on allowed locations (shared inventory)
-    let itemsQuery = supabase
-      .from("items")
-      .select("*")
-      .order("created_at", { ascending: false });
+    return Array.from(map.values()).sort((a, b) =>
+      a.category.localeCompare(b.category)
+    );
+  }, [items]);
 
-    if (allowedLocations !== "ALL") {
-      itemsQuery = itemsQuery.in("location", allowedLocations);
-    }
-
-    const { data: itemsData, error: itemsError } = await itemsQuery;
-
-    if (itemsError) {
-      console.error("Items error:", itemsError);
-    }
-
-    // 6) Load categories (shared master data)
-    const { data: categoriesData, error: categoriesError } = await supabase
-      .from("categories")
-      .select("*")
-      .order("name", { ascending: true });
-
-    if (categoriesError) {
-      console.error("Categories error:", categoriesError);
-    }
-
-    // 7) Apply to state
-    setItems((itemsData || []) as Item[]);
-
-    // Build category options (prefer master tables, fall back to items)
-    const categorySet = new Set<string>();
-    (categoriesData as CategoryRow[] | null)?.forEach((c) => {
-      if (c.name) categorySet.add(c.name);
-    });
-    (itemsData as Item[] | null)?.forEach((i) => {
-      if (i.category) categorySet.add(i.category);
-    });
-    setCategoryOptions(Array.from(categorySet).sort());
-
-    // Build location options (from master + items)
-    const locationSet = new Set<string>();
-    (locationsData as LocationRow[] | null)?.forEach((l) => {
-      if (l.name) locationSet.add(l.name);
-    });
-    (itemsData as Item[] | null)?.forEach((i) => {
-      if (i.location) locationSet.add(i.location);
-    });
-    setLocationOptions(Array.from(locationSet).sort());
-
-    setLoading(false);
+  const showCategoryTiles = () => {
+    setViewMode("tiles");
   };
 
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-    router.push("/auth");
+  const showCategories = () => {
+    setSelectedCategory(null);
+    setSearch("");
+    setViewMode("categories");
   };
 
-  const handleSelectItem = (item: Item) => {
-    setSelectedItem(item);
-    // Initialize verification form defaults
-    setVerifyDate(new Date().toISOString().slice(0, 10)); // today
-    setVerifyQty(item.quantity || "");
-    setVerifyNotes("");
-    loadVerifications(item.id);
+  const openCategory = (cat: string) => {
+    setSelectedCategory(cat);
+    setSearch("");
+    setViewMode("tiles"); // click category shows tiles
   };
 
-  const loadVerifications = async (itemId: string) => {
-    setLoadingVerifications(true);
-    const { data, error } = await supabase
-      .from("stock_verifications")
-      .select("*")
-      .eq("item_id", itemId)
-      .order("verified_at", { ascending: false });
+  if (!userReady || companyLoading || loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-slate-500">
+        Loading…
+      </div>
+    );
+  }
 
-    if (error) {
-      console.error("Error loading verifications:", error);
-    } else {
-      setVerifications((data || []) as StockVerification[]);
-    }
-    setLoadingVerifications(false);
-  };
-
-  const handleSaveVerification = async () => {
-    if (!selectedItem || verifyQty === "" || !verifyDate) return;
-
-    setSavingVerification(true);
-
-    const { data: userData } = await supabase.auth.getUser();
-    const userId = userData?.user?.id || null;
-
-    const { data, error } = await supabase
-      .from("stock_verifications")
-      .insert({
-        item_id: selectedItem.id,
-        verified_at: verifyDate,
-        verified_qty: verifyQty,
-        notes: verifyNotes || null,
-        verified_by: userId,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      console.error("Error saving verification:", error);
-    } else if (data) {
-      // Prepend new verification to list
-      setVerifications((prev) => [data as StockVerification, ...prev]);
-    }
-
-    setSavingVerification(false);
-  };
-
-  // Calculate stats (uses master category count)
-  const stats = {
-    totalValue: items.reduce(
-      (sum, i) => sum + (i.purchase_price || 0) * i.quantity,
-      0
-    ),
-    lowStock: items.filter((i) => i.quantity < 5).length,
-    totalItems: items.reduce((sum, i) => sum + i.quantity, 0),
-    categories: categoryOptions.length,
-  };
-
-  // Filter items
-  const filteredItems = items.filter((item) => {
-    const matchesSearch =
-      searchTerm === "" ||
-      `${item.name} ${item.description || ""} ${item.te_number || ""}`
-        .toLowerCase()
-        .includes(searchTerm.toLowerCase());
-    const matchesCategory =
-      filterCategory === "all" || item.category === filterCategory;
-    const matchesLocation =
-      filterLocation === "all" || item.location === filterLocation;
-    return matchesSearch && matchesCategory && matchesLocation;
-  });
+  if (!companyId) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-slate-500">
+        No company assigned to this user.
+      </div>
+    );
+  }
 
   return (
-    <div className="min-h-screen">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-40 shadow-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <div className="flex items-center gap-3">
-              <div className="bg-gradient-to-br from-blue-600 to-indigo-600 p-2 rounded-lg">
-                <Package className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h1 className="text-xl font-bold text-slate-900">stokstak</h1>
-                <p className="text-xs text-slate-500">
-                  Inventory & Purchasing
-                </p>
-              </div>
+    <div className="min-h-screen bg-slate-50">
+      {/* Top header */}
+      <header className="bg-white border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white flex items-center justify-center">
+              <Package className="w-5 h-5" />
             </div>
-
-            <div className="flex items-center gap-2">
-              {/* 👇 Show User Management link when logged-in user is admin */}
-              {profile?.role === "admin" && (
-                <Link
-                  href="/admin/users"
-                  className="hidden sm:flex items-center gap-2 px-3 py-2 border rounded-lg text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  <Users className="w-4 h-4" />
-                  Manage Users
-                </Link>
-              )}
-
-              <Link
-                href="/add-item"
-                className="hidden sm:flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors text-sm font-medium"
-              >
-                <Plus className="w-4 h-4" />
-                Add Item
-              </Link>
-
-              <button className="p-2 hover:bg-slate-100 rounded-lg transition-colors">
-                <Settings className="w-5 h-5 text-slate-600" />
-              </button>
-
-              <div className="relative">
-                <button
-                  onClick={() => setShowUserMenu(!showUserMenu)}
-                  className="flex items-center gap-2 p-2 hover:bg-slate-100 rounded-lg"
-                >
-                  <div className="w-8 h-8 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-full flex items-center justify-center text-white text-sm font-medium">
-                    {profile?.display_name?.[0]?.toUpperCase() || "U"}
-                  </div>
-                  <ChevronDown className="w-4 h-4 text-slate-600" />
-                </button>
-
-                {showUserMenu && (
-                  <div className="absolute right-0 mt-2 w-52 bg-white rounded-lg shadow-lg border py-1">
-                    <div className="px-4 py-2 text-xs text-slate-500 border-b">
-                      {profile?.display_name
-                        ? `Signed in as ${profile.display_name}`
-                        : "Signed in"}
-                      {profile?.role && (
-                        <span className="block text-[11px] text-slate-400">
-                          Role: {profile.role}
-                        </span>
-                      )}
-                    </div>
-
-                    {profile?.role === "admin" && (
-                      <Link
-                        href="/admin/users"
-                        className="w-full px-4 py-2 text-left text-sm hover:bg-slate-50 flex gap-2 items-center"
-                      >
-                        <Users className="w-4 h-4" />
-                        Manage users
-                      </Link>
-                    )}
-
-                    <button
-                      onClick={handleLogout}
-                      className="w-full px-4 py-2 text-left text-sm text-red-600 hover:bg-red-50 flex gap-2"
-                    >
-                      <LogOut className="w-4 h-4" />
-                      Log out
-                    </button>
-                  </div>
-                )}
-              </div>
+            <div>
+              <p className="text-sm font-semibold text-slate-900">Stokstak</p>
+              <p className="text-xs text-slate-500">
+                Company inventory dashboard
+              </p>
             </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Link
+              href="/add-item"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 text-sm"
+            >
+              <PlusCircle className="w-4 h-4" />
+              Add Item
+            </Link>
+
+            <Link
+              href="/reports"
+              className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-sm text-slate-700"
+            >
+              <BarChart3 className="w-4 h-4" />
+              Reports
+            </Link>
           </div>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {/* Stats Cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-          <div className="bg-white rounded-xl p-4 shadow-sm border">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-slate-600 mb-1">Total Value</p>
-                <p className="text-2xl font-bold">
-                  ${stats.totalValue.toFixed(2)}
-                </p>
-              </div>
-              <div className="bg-green-100 p-3 rounded-lg">
-                <DollarSign className="w-6 h-6 text-green-600" />
-              </div>
+      <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+        {error && (
+          <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
+            {error}
+          </div>
+        )}
+
+        {/* KPI row (rearranged: Total Value, Total Items, Categories) */}
+        <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-white border rounded-2xl p-4 flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-500 mb-1">Total Value</p>
+              <p className="text-2xl font-semibold text-slate-900">
+                {formatCurrency(overall.totalValue)}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Based on unit price × qty
+              </p>
+            </div>
+            <div className="bg-emerald-50 p-3 rounded-xl">
+              <DollarSign className="w-6 h-6 text-emerald-600" />
             </div>
           </div>
 
-          <div className="bg-white rounded-xl p-4 shadow-sm border">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-slate-600 mb-1">Total Items</p>
-                <p className="text-2xl font-bold">{stats.totalItems}</p>
-              </div>
-              <div className="bg-blue-100 p-3 rounded-lg">
-                <Package className="w-6 h-6 text-blue-600" />
-              </div>
+          <div className="bg-white border rounded-2xl p-4 flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-500 mb-1">Total Items</p>
+              <p className="text-2xl font-semibold text-slate-900">
+                {overall.totalQty}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Sum of all quantities
+              </p>
+            </div>
+            <div className="bg-blue-50 p-3 rounded-xl">
+              <Package className="w-6 h-6 text-blue-600" />
             </div>
           </div>
 
-          <div className="bg-white rounded-xl p-4 shadow-sm border">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-slate-600 mb-1">Low Stock</p>
-                <p className="text-2xl font-bold">{stats.lowStock}</p>
-              </div>
-              <div className="bg-orange-100 p-3 rounded-lg">
-                <AlertCircle className="w-6 h-6 text-orange-600" />
-              </div>
+          <div className="bg-white border rounded-2xl p-4 flex items-center justify-between">
+            <div>
+              <p className="text-xs text-slate-500 mb-1">Categories</p>
+              <p className="text-2xl font-semibold text-slate-900">
+                {overall.categories}
+              </p>
+              <p className="text-[11px] text-slate-500 mt-1">
+                Grouped reporting view
+              </p>
+            </div>
+            <div className="bg-purple-50 p-3 rounded-xl">
+              <Tag className="w-6 h-6 text-purple-600" />
             </div>
           </div>
+        </section>
 
-          <div className="bg-white rounded-xl p-4 shadow-sm border">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-slate-600 mb-1">Categories</p>
-                <p className="text-2xl font-bold">{stats.categories}</p>
-              </div>
-              <div className="bg-purple-100 p-3 rounded-lg">
-                <Tag className="w-6 h-6 text-purple-600" />
-              </div>
-            </div>
+        {/* Toolbar */}
+        <section className="bg-white border rounded-2xl p-4 flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
+          <div className="flex items-center gap-2">
+            {selectedCategory ? (
+              <button
+                type="button"
+                onClick={showCategories}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border hover:bg-slate-50 text-sm"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                All Categories
+              </button>
+            ) : (
+              <p className="text-sm font-semibold text-slate-900">
+                {viewMode === "categories"
+                  ? "Browse by Category"
+                  : "Inventory"}
+              </p>
+            )}
           </div>
-        </div>
 
-        {/* Search & Filters */}
-        <div className="bg-white rounded-xl shadow-sm border p-4 mb-6">
-          <div className="flex flex-col lg:flex-row gap-4">
-            <div className="flex-1 relative">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-5 h-5 text-slate-400" />
+          <div className="flex items-center gap-2">
+            {/* Search (applies in tiles/list views) */}
+            <div className="relative flex-1 min-w-[180px]">
+              <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
               <input
-                type="text"
-                placeholder="Search items..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 border rounded-lg focus:ring-2 focus:ring-blue-500"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search item name or TE#"
+                className="w-full pl-9 pr-3 py-2 border rounded-lg text-sm"
               />
             </div>
 
-            <button
-              onClick={() => setShowFilters(!showFilters)}
-              className="flex items-center justify-center gap-2 px-4 py-2.5 border rounded-lg hover:bg-slate-50"
-            >
-              <Filter className="w-5 h-5" />
-              Filters
-            </button>
-
-            <div className="flex items-center gap-2 border rounded-lg p-1">
+            <div className="hidden sm:flex items-center gap-2">
               <button
-                onClick={() => setViewMode("grid")}
-                className={`p-2 rounded ${
-                  viewMode === "grid"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100"
-                }`}
+                type="button"
+                onClick={() => setViewMode("categories")}
+                className={[
+                  "px-3 py-2 rounded-lg border text-sm inline-flex items-center gap-2",
+                  viewMode === "categories"
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "hover:bg-slate-50",
+                ].join(" ")}
               >
-                <Grid className="w-4 h-4" />
+                <Grid3X3 className="w-4 h-4" />
+                Categories
               </button>
+
               <button
+                type="button"
+                onClick={showCategoryTiles}
+                className={[
+                  "px-3 py-2 rounded-lg border text-sm inline-flex items-center gap-2",
+                  viewMode === "tiles"
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "hover:bg-slate-50",
+                ].join(" ")}
+              >
+                <Grid3X3 className="w-4 h-4" />
+                Tiles
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setViewMode("list")}
-                className={`p-2 rounded ${
+                className={[
+                  "px-3 py-2 rounded-lg border text-sm inline-flex items-center gap-2",
                   viewMode === "list"
-                    ? "bg-blue-600 text-white"
-                    : "hover:bg-slate-100"
-                }`}
+                    ? "bg-blue-600 text-white border-blue-600"
+                    : "hover:bg-slate-50",
+                ].join(" ")}
               >
                 <List className="w-4 h-4" />
+                List
               </button>
             </div>
-
-            <Link
-              href="/reports"
-              className="flex items-center justify-center gap-2 px-4 py-2.5 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
-            >
-              <BarChart3 className="w-5 h-5" />
-              Reports
-            </Link>
-            <Link
-              href="/purchase-requests"
-              className="flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
-            >
-              <Package className="w-5 h-5" />
-              Purchasing
-            </Link>
           </div>
+        </section>
 
-          {showFilters && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 pt-4 border-t">
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="block text-sm font-medium">Category</label>
-                  <Link
-                    href="/settings/categories"
-                    className="text-xs text-blue-600 hover:underline"
-                  >
-                    Manage categories
-                  </Link>
-                </div>
-                <select
-                  value={filterCategory}
-                  onChange={(e) => setFilterCategory(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-lg"
-                >
-                  <option value="all">All Categories</option>
-                  {categoryOptions.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat}
-                    </option>
-                  ))}
-                </select>
+        {/* CATEGORY VIEW (default on desktop) */}
+        {viewMode === "categories" && (
+          <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {categorySummaries.length === 0 ? (
+              <div className="bg-white border rounded-2xl p-6 text-center text-slate-500 sm:col-span-2 lg:col-span-3">
+                No items yet. Add your first item.
               </div>
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <label className="block text-sm font-medium">Location</label>
-                  <Link
-                    href="/settings/locations"
-                    className="text-xs text-blue-600 hover:underline"
-                  >
-                    Manage locations
-                  </Link>
-                </div>
-                <select
-                  value={filterLocation}
-                  onChange={(e) => setFilterLocation(e.target.value)}
-                  className="w-full px-3 py-2 border rounded-lg"
+            ) : (
+              categorySummaries.map((c) => (
+                <button
+                  key={c.category}
+                  onClick={() => openCategory(c.category)}
+                  className="text-left bg-white border rounded-2xl p-4 hover:shadow-sm transition"
                 >
-                  <option value="all">All Locations</option>
-                  {locationOptions.map((loc) => (
-                    <option key={loc} value={loc}>
-                      {loc}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-          )}
-        </div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {c.category}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        {c.itemCount} items • Qty {c.totalQty}
+                      </p>
+                    </div>
+                    <p className="text-sm font-semibold text-slate-900">
+                      {formatCurrency(c.totalValue)}
+                    </p>
+                  </div>
 
-        {/* Results */}
-        {loading ? (
-          <p className="text-center py-12">Loading...</p>
-        ) : viewMode === "grid" ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {filteredItems.map((item) => (
-              <div
-                key={item.id}
-                onClick={() => handleSelectItem(item)}
-                className="bg-white rounded-xl shadow-sm border overflow-hidden hover:shadow-md transition cursor-pointer group"
-              >
-                <div className="relative aspect-square bg-slate-100">
-                  {item.image_url ? (
-                    <img
-                      src={item.image_url}
-                      alt={item.name}
-                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                    />
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center">
-                      <FileImage className="w-12 h-12 text-slate-300" />
-                    </div>
-                  )}
-                  {item.quantity < 5 && (
-                    <div className="absolute top-2 right-2 bg-orange-500 text-white text-xs px-2 py-1 rounded-full flex items-center gap-1">
-                      <AlertCircle className="w-3 h-3" />
-                      Low
-                    </div>
-                  )}
-                  <div className="absolute top-2 left-2 bg-white/90 backdrop-blur-sm text-xs px-2 py-1 rounded-full font-medium">
-                    Qty: {item.quantity}
+                  <div className="mt-3 grid grid-cols-6 gap-1">
+                    {Array.from({ length: MAX_CATEGORY_THUMBS }).map((_, idx) => {
+                      const url = c.thumbnails[idx] || null;
+                      return (
+                        <div
+                          key={idx}
+                          className="aspect-square rounded-lg border bg-slate-50 overflow-hidden flex items-center justify-center"
+                        >
+                          {url ? (
+                            <img
+                              src={url}
+                              alt=""
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <FileImage className="w-4 h-4 text-slate-300" />
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
-                </div>
-                <div className="p-4">
-                  <h3 className="font-semibold mb-1 line-clamp-1">
-                    {item.name}
-                  </h3>
-                  <p className="text-sm text-slate-600 mb-2 line-clamp-2">
-                    {item.description}
-                  </p>
-                  <div className="flex items-center gap-2 text-xs text-slate-500 mb-2">
-                    <Tag className="w-3 h-3" />
-                    {item.category}
-                  </div>
-                  <div className="flex items-center justify-between pt-2 border-t">
-                    <span className="text-xs text-slate-500">
-                      {item.te_number}
-                    </span>
-                    <span className="text-sm font-semibold">
-                      ${item.purchase_price?.toFixed(2)}
-                    </span>
-                  </div>
-                </div>
+                </button>
+              ))
+            )}
+          </section>
+        )}
+
+        {/* TILES VIEW (like your existing main page tiles, but filtered by category if selected) */}
+        {viewMode === "tiles" && (
+          <section>
+            {selectedCategory && (
+              <div className="mb-3">
+                <p className="text-sm text-slate-600">
+                  Category:{" "}
+                  <span className="font-semibold text-slate-900">
+                    {selectedCategory}
+                  </span>
+                </p>
               </div>
-            ))}
-          </div>
-        ) : (
-          <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
-            <table className="w-full">
-              <thead className="bg-slate-50 border-b">
-                <tr>
-                  <th className="text-left p-4 text-sm font-medium">Item</th>
-                  <th className="text-left p-4 text-sm font-medium">TE#</th>
-                  <th className="text-left p-4 text-sm font-medium">
-                    Category
-                  </th>
-                  <th className="text-left p-4 text-sm font-medium">
-                    Location
-                  </th>
-                  <th className="text-right p-4 text-sm font-medium">Qty</th>
-                  <th className="text-right p-4 text-sm font-medium">Price</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredItems.map((item) => (
-                  <tr
-                    key={item.id}
-                    onClick={() => handleSelectItem(item)}
-                    className="border-b hover:bg-slate-50 cursor-pointer"
-                  >
-                    <td className="p-4">
-                      <div className="flex items-center gap-3">
-                        {item.image_url ? (
+            )}
+
+            {filteredItems.length === 0 ? (
+              <div className="bg-white border rounded-2xl p-6 text-center text-slate-500">
+                No items match your filters.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {filteredItems.map((it) => {
+                  const img = it.image_url || it.image_url_2;
+                  const total = (it.purchase_price || 0) * it.quantity;
+
+                  return (
+                    <div
+                      key={it.id}
+                      className="bg-white border rounded-2xl overflow-hidden hover:shadow-sm transition"
+                    >
+                      <div className="aspect-[4/3] bg-slate-50 overflow-hidden flex items-center justify-center">
+                        {img ? (
                           <img
-                            src={item.image_url}
-                            alt={item.name}
-                            className="w-12 h-12 rounded-lg object-cover"
+                            src={img}
+                            alt={it.name}
+                            className="w-full h-full object-cover"
                           />
                         ) : (
-                          <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center">
-                            <FileImage className="w-5 h-5 text-slate-400" />
-                          </div>
+                          <FileImage className="w-10 h-10 text-slate-300" />
                         )}
-                        <div>
-                          <p className="font-medium">{item.name}</p>
-                          <p className="text-sm text-slate-500 line-clamp-1">
-                            {item.description}
+                      </div>
+
+                      <div className="p-4 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-semibold text-slate-900 line-clamp-1">
+                              {it.name}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {it.category || "Uncategorized"} •{" "}
+                              {it.location || "Unspecified"}
+                            </p>
+                          </div>
+
+                          <div className="text-right">
+                            <p className="text-sm font-semibold text-slate-900">
+                              Qty {it.quantity}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              {total ? formatCurrency(total) : ""}
+                            </p>
+                          </div>
+                        </div>
+
+                        {it.te_number && (
+                          <p className="text-xs text-slate-500">
+                            TE#: {it.te_number}
+                          </p>
+                        )}
+
+                        {it.description && (
+                          <p className="text-xs text-slate-600 line-clamp-2">
+                            {it.description}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* LIST VIEW (default on mobile) */}
+        {viewMode === "list" && (
+          <section className="bg-white border rounded-2xl overflow-hidden">
+            <div className="p-4 border-b flex items-center justify-between">
+              <p className="text-sm font-semibold text-slate-900">
+                Items ({filteredItems.length})
+              </p>
+              {selectedCategory && (
+                <button
+                  type="button"
+                  onClick={showCategories}
+                  className="text-sm text-blue-600 hover:underline"
+                >
+                  All Categories
+                </button>
+              )}
+            </div>
+
+            {filteredItems.length === 0 ? (
+              <div className="p-6 text-center text-slate-500">
+                No items match your filters.
+              </div>
+            ) : (
+              <div className="divide-y">
+                {filteredItems.map((it) => {
+                  const img = it.image_url || it.image_url_2;
+                  return (
+                    <div key={it.id} className="p-4 flex gap-3">
+                      <div className="w-14 h-14 rounded-xl border bg-slate-50 overflow-hidden flex items-center justify-center">
+                        {img ? (
+                          <img
+                            src={img}
+                            alt={it.name}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <FileImage className="w-6 h-6 text-slate-300" />
+                        )}
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-slate-900 truncate">
+                              {it.name}
+                            </p>
+                            <p className="text-xs text-slate-500 truncate">
+                              {it.category || "Uncategorized"} •{" "}
+                              {it.location || "Unspecified"}
+                            </p>
+                          </div>
+                          <p className="text-sm font-semibold text-slate-900">
+                            {it.quantity}
                           </p>
                         </div>
+
+                        {it.te_number && (
+                          <p className="text-xs text-slate-500 mt-1">
+                            TE#: {it.te_number}
+                          </p>
+                        )}
                       </div>
-                    </td>
-                    <td className="p-4 text-sm">{item.te_number}</td>
-                    <td className="p-4 text-sm">{item.category}</td>
-                    <td className="p-4 text-sm">{item.location}</td>
-                    <td className="p-4 text-right">
-                      <span
-                        className={`inline-flex px-2 py-1 text-xs font-medium rounded-full ${
-                          item.quantity < 5
-                            ? "bg-orange-100 text-orange-700"
-                            : "bg-green-100 text-green-700"
-                        }`}
-                      >
-                        {item.quantity}
-                      </span>
-                    </td>
-                    <td className="p-4 text-right text-sm font-semibold">
-                      ${item.purchase_price?.toFixed(2)}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         )}
       </main>
-
-      {/* Item Detail Modal - with both photos & stock verification */}
-      {selectedItem && (
-        <div
-          className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4"
-          onClick={() => setSelectedItem(null)}
-        >
-          <div
-            className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[90vh] overflow-y-auto"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="sticky top-0 bg-white border-b px-6 py-4 flex items-center justify-between z-10">
-              <h2 className="text-xl font-bold">{selectedItem.name}</h2>
-              <div className="flex gap-2">
-                <Link
-                  href={`/edit-item/${selectedItem.id}`}
-                  className="p-2 hover:bg-blue-50 rounded-lg text-blue-600"
-                >
-                  <Edit className="w-5 h-5" />
-                </Link>
-                <button
-                  onClick={() => setSelectedItem(null)}
-                  className="p-2 hover:bg-slate-100 rounded-lg"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            <div className="p-6">
-              {/* BOTH PHOTOS SIDE BY SIDE */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-                {/* Primary Photo */}
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
-                    Primary Photo
-                  </label>
-                  <div className="aspect-square bg-slate-100 rounded-xl overflow-hidden border-2 border-slate-200">
-                    {selectedItem.image_url ? (
-                      <img
-                        src={selectedItem.image_url}
-                        alt={selectedItem.name}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="text-center">
-                          <FileImage className="w-16 h-16 text-slate-300 mx-auto mb-2" />
-                          <p className="text-xs text-slate-400">
-                            No primary photo
-                          </p>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Secondary Photo */}
-                <div className="space-y-2">
-                  <label className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
-                    Secondary Photo
-                  </label>
-                  <div className="aspect-square bg-slate-100 rounded-xl overflow-hidden border-2 border-slate-200">
-                    {selectedItem.image_url_2 ? (
-                      <img
-                        src={selectedItem.image_url_2}
-                        alt={`${selectedItem.name} (2)`}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="w-full h-full flex items-center justify-center">
-                        <div className="text-center">
-                          <FileImage className="w-16 h-16 text-slate-300 mx-auto mb-2" />
-                          <p className="text-xs text-slate-400">
-                            No secondary photo
-                          </p>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {/* Item Details */}
-              <div className="bg-slate-50 rounded-xl p-4 mb-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <p className="text-sm text-slate-600 mb-1">Quantity</p>
-                    <p className="text-2xl font-bold">
-                      {selectedItem.quantity}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-sm text-slate-600 mb-1">Unit Price</p>
-                    <p className="text-2xl font-bold">
-                      ${selectedItem.purchase_price?.toFixed(2) || "0.00"}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                <div className="flex gap-3 bg-white p-3 rounded-lg border">
-                  <Tag className="w-5 h-5 text-slate-400 flex-shrink-0" />
-                  <div>
-                    <p className="text-sm text-slate-600">Category</p>
-                    <p className="font-medium">
-                      {selectedItem.category || "-"}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 bg-white p-3 rounded-lg border">
-                  <MapPin className="w-5 h-5 text-slate-400 flex-shrink-0" />
-                  <div>
-                    <p className="text-sm text-slate-600">Location</p>
-                    <p className="font-medium">
-                      {selectedItem.location || "-"}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 bg-white p-3 rounded-lg border">
-                  <Package className="w-5 h-5 text-slate-400 flex-shrink-0" />
-                  <div>
-                    <p className="text-sm text-slate-600">TE Number</p>
-                    <p className="font-medium">
-                      {selectedItem.te_number || "-"}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 bg-white p-3 rounded-lg border">
-                  <Calendar className="w-5 h-5 text-slate-400 flex-shrink-0" />
-                  <div>
-                    <p className="text-sm text-slate-600">Purchase Date</p>
-                    <p className="font-medium">
-                      {selectedItem.purchase_date || "-"}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {selectedItem.description && (
-                <div className="bg-slate-50 rounded-xl p-4 mb-6">
-                  <h3 className="font-semibold mb-2">Description</h3>
-                  <p className="text-slate-700">{selectedItem.description}</p>
-                </div>
-              )}
-
-              {/* Stock Verification Section */}
-              <div className="bg-white rounded-xl p-4 border mb-4">
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="font-semibold flex items-center gap-2">
-                    <CheckCircle2 className="w-5 h-5 text-emerald-600" />
-                    Stock Verification
-                  </h3>
-                </div>
-
-                {/* Verification Form */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-600 mb-1">
-                      Verification Date
-                    </label>
-                    <input
-                      type="date"
-                      value={verifyDate}
-                      onChange={(e) => setVerifyDate(e.target.value)}
-                      className="w-full px-3 py-2 border rounded-lg text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-slate-600 mb-1">
-                      Verified Quantity
-                    </label>
-                    <input
-                      type="number"
-                      value={verifyQty}
-                      onChange={(e) =>
-                        setVerifyQty(
-                          e.target.value === ""
-                            ? ""
-                            : Number(e.target.value)
-                        )
-                      }
-                      className="w-full px-3 py-2 border rounded-lg text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-slate-600 mb-1">
-                      Notes
-                    </label>
-                    <input
-                      type="text"
-                      value={verifyNotes}
-                      onChange={(e) => setVerifyNotes(e.target.value)}
-                      placeholder="e.g. Counted on shelf A3"
-                      className="w-full px-3 py-2 border rounded-lg text-sm"
-                    />
-                  </div>
-                </div>
-                <button
-                  onClick={handleSaveVerification}
-                  disabled={savingVerification || verifyQty === "" || !verifyDate}
-                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  {savingVerification ? "Saving..." : "Save Verification"}
-                </button>
-
-                {/* Verification History */}
-                <div className="mt-4">
-                  <h4 className="text-sm font-semibold mb-2">
-                    Verification History
-                  </h4>
-                  {loadingVerifications ? (
-                    <p className="text-xs text-slate-500">
-                      Loading verification history...
-                    </p>
-                  ) : verifications.length === 0 ? (
-                    <p className="text-xs text-slate-500">
-                      No physical stock verification recorded yet.
-                    </p>
-                  ) : (
-                    <div className="max-h-48 overflow-y-auto border rounded-lg">
-                      <table className="w-full text-xs">
-                        <thead className="bg-slate-50 border-b">
-                          <tr>
-                            <th className="text-left px-3 py-2 font-medium">
-                              Date
-                            </th>
-                            <th className="text-left px-3 py-2 font-medium">
-                              Qty
-                            </th>
-                            <th className="text-left px-3 py-2 font-medium">
-                              Notes
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {verifications.map((v) => (
-                            <tr key={v.id} className="border-b last:border-0">
-                              <td className="px-3 py-2">
-                                {v.verified_at?.slice(0, 10)}
-                              </td>
-                              <td className="px-3 py-2">{v.verified_qty}</td>
-                              <td className="px-3 py-2">
-                                {v.notes || "-"}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Mobile FAB */}
-      <Link
-        href="/add-item"
-        className="sm:hidden fixed bottom-6 right-6 bg-blue-600 text-white p-4 rounded-full shadow-lg hover:bg-blue-700 z-30"
-      >
-        <Plus className="w-6 h-6" />
-      </Link>
     </div>
   );
 }
