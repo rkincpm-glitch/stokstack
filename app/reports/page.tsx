@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState, ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
+import { useCompany } from "@/lib/useCompany";
 import {
   ArrowLeft,
   BarChart3,
@@ -16,11 +17,11 @@ import {
   X,
   CheckCircle2,
   Upload,
-  Activity,
   TrendingUp,
   Clock,
   FileSpreadsheet,
   FileText,
+  Layers,
 } from "lucide-react";
 
 type Item = {
@@ -54,10 +55,10 @@ type LastVerification = {
 };
 
 const VERIFICATION_STALE_DAYS = 90;
-const LOW_STOCK_THRESHOLD = 5;
 
 export default function ReportsPage() {
   const router = useRouter();
+  const { loading: companyLoading, companyId } = useCompany();
 
   const [userId, setUserId] = useState<string | null>(null);
   const [items, setItems] = useState<Item[]>([]);
@@ -93,16 +94,17 @@ export default function ReportsPage() {
 
   useEffect(() => {
     void loadData();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyLoading, companyId]);
 
   const loadData = async () => {
+    if (companyLoading) return;
+
     setLoading(true);
     setErrorMsg(null);
 
     const { data: userData, error: userError } = await supabase.auth.getUser();
-    if (userError) {
-      console.error(userError);
-    }
+    if (userError) console.error(userError);
 
     if (!userData?.user) {
       router.push("/auth");
@@ -110,10 +112,19 @@ export default function ReportsPage() {
     }
     setUserId(userData.user.id);
 
+    if (!companyId) {
+      setErrorMsg("No company assigned to this user.");
+      setItems([]);
+      setGroups([]);
+      setLoading(false);
+      return;
+    }
+
     try {
       const { data: itemsData, error: itemsError } = await supabase
         .from("items")
         .select("*")
+        .eq("company_id", companyId)
         .order("category", { ascending: true })
         .order("name", { ascending: true });
 
@@ -153,10 +164,11 @@ export default function ReportsPage() {
       );
       setGroups(grouped);
 
-      // Last verifications
+      // Last verifications (company scoped)
       const { data: verData, error: verError } = await supabase
         .from("stock_verifications")
         .select("item_id, verified_at, verified_qty, photo_url")
+        .eq("company_id", companyId)
         .order("verified_at", { ascending: false });
 
       if (verError) {
@@ -207,15 +219,9 @@ export default function ReportsPage() {
 
   const getLastVerificationMeta = (itemId: string) => {
     const lv = lastVerifications[itemId];
-    if (!lv) {
-      return { date: "", qty: "", age: "" };
-    }
+    if (!lv) return { date: "", qty: "", age: "" };
     const age = daysSince(lv.verified_at);
-    return {
-      date: lv.verified_at,
-      qty: String(lv.verified_qty),
-      age: String(age),
-    };
+    return { date: lv.verified_at, qty: String(lv.verified_qty), age: String(age) };
   };
 
   // Derived options for filters (from all items)
@@ -242,21 +248,13 @@ export default function ReportsPage() {
     const groupMap = new Map<string, CategoryGroup>();
 
     const matchesFilters = (it: Item) => {
-      if (
-        filterCategory !== "all" &&
-        (it.category || "Uncategorized") !== filterCategory
-      ) {
+      if (filterCategory !== "all" && (it.category || "Uncategorized") !== filterCategory)
         return false;
-      }
-      if (
-        filterLocation !== "all" &&
-        (it.location || "Unspecified") !== filterLocation
-      ) {
+      if (filterLocation !== "all" && (it.location || "Unspecified") !== filterLocation)
         return false;
-      }
-      if (filterType !== "all" && (it.type || "Unspecified") !== filterType) {
+      if (filterType !== "all" && (it.type || "Unspecified") !== filterType)
         return false;
-      }
+
       if (search.trim()) {
         const term = search.toLowerCase();
         const haystack = `${it.name} ${it.te_number || ""}`.toLowerCase();
@@ -270,12 +268,7 @@ export default function ReportsPage() {
 
       const key = it.category || "Uncategorized";
       if (!groupMap.has(key)) {
-        groupMap.set(key, {
-          category: key,
-          totalQty: 0,
-          totalValue: 0,
-          items: [],
-        });
+        groupMap.set(key, { category: key, totalQty: 0, totalValue: 0, items: [] });
       }
       const g = groupMap.get(key)!;
       const price = it.purchase_price || 0;
@@ -284,12 +277,10 @@ export default function ReportsPage() {
       g.items.push(it);
     }
 
-    return Array.from(groupMap.values()).sort((a, b) =>
-      a.category.localeCompare(b.category)
-    );
+    return Array.from(groupMap.values()).sort((a, b) => a.category.localeCompare(b.category));
   }, [items, filterCategory, filterLocation, filterType, search]);
 
-  // High-level metrics for management
+  // KPI (rearranged: Total Value, Total Items, Categories)
   const overall = useMemo(() => {
     const totalValue = items.reduce(
       (sum, i) => sum + (i.purchase_price || 0) * i.quantity,
@@ -297,29 +288,14 @@ export default function ReportsPage() {
     );
     const totalQty = items.reduce((sum, i) => sum + i.quantity, 0);
 
-    const lowStockCount = items.filter(
-      (i) => i.quantity > 0 && i.quantity < LOW_STOCK_THRESHOLD
-    ).length;
+    const categories = new Set(
+      items.map((i) => (i.category || "Uncategorized").trim())
+    ).size;
 
-    const staleOrNeverVerifiedCount = items.filter((i) => {
-      const lv = lastVerifications[i.id];
-      if (!lv) return true;
-      const days = daysSince(lv.verified_at);
-      return days > VERIFICATION_STALE_DAYS;
-    }).length;
+    const avgUnitValue = totalQty > 0 ? totalValue / totalQty : 0;
 
-    const avgUnitValue =
-      totalQty > 0 ? totalValue / totalQty : 0;
-
-    return {
-      totalValue,
-      totalQty,
-      lowStockCount,
-      staleOrNeverVerifiedCount,
-      avgUnitValue,
-      categories: groups.length,
-    };
-  }, [items, lastVerifications, groups]);
+    return { totalValue, totalQty, categories, avgUnitValue };
+  }, [items]);
 
   // Top categories by value
   const topCategoriesByValue = useMemo(() => {
@@ -336,15 +312,6 @@ export default function ReportsPage() {
     withValue.sort((a, b) => b.totalValue - a.totalValue);
     return withValue.slice(0, 5);
   }, [items]);
-
-  // Low stock items list
-  const lowStockItems = useMemo(
-    () =>
-      items
-        .filter((i) => i.quantity > 0 && i.quantity < LOW_STOCK_THRESHOLD)
-        .slice(0, 5),
-    [items]
-  );
 
   // Verification-stale items
   const staleVerificationItems = useMemo(() => {
@@ -387,8 +354,7 @@ export default function ReportsPage() {
       }
 
       const { data } = supabase.storage.from("item-images").getPublicUrl(path);
-      const url = data.publicUrl;
-      setVerPhotoUrl(url);
+      setVerPhotoUrl(data.publicUrl);
     } catch (err) {
       console.error(err);
       setVerificationError("Unexpected error uploading verification photo.");
@@ -402,6 +368,8 @@ export default function ReportsPage() {
 
   const handleAddVerification = async () => {
     if (!selectedItem) return;
+    if (!companyId) return;
+
     if (verQty === "" || Number.isNaN(Number(verQty))) {
       setVerificationError("Verified quantity must be a number.");
       return;
@@ -415,6 +383,7 @@ export default function ReportsPage() {
       const qtyNum = Number(verQty);
 
       const { error } = await supabase.from("stock_verifications").insert({
+        company_id: companyId,
         item_id: selectedItem.id,
         verified_at: verDate || new Date().toISOString().slice(0, 10),
         verified_qty: qtyNum,
@@ -430,7 +399,6 @@ export default function ReportsPage() {
         return;
       }
 
-      // Update local last-verification cache
       setLastVerifications((prev) => ({
         ...prev,
         [selectedItem.id]: {
@@ -451,7 +419,6 @@ export default function ReportsPage() {
   };
 
   // ---------- EXPORT HELPERS ----------
-
   const escapeCsv = (value: string | number | null | undefined) => {
     if (value === null || value === undefined) return "";
     const str = String(value);
@@ -595,30 +562,12 @@ export default function ReportsPage() {
 <title>Inventory Report</title>
 <meta charset="utf-8" />
 <style>
-body {
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-size: 12px;
-  padding: 16px;
-}
-h1 {
-  font-size: 18px;
-  margin-bottom: 4px;
-}
-p {
-  margin: 0 0 8px 0;
-}
-table {
-  border-collapse: collapse;
-  width: 100%;
-}
-th, td {
-  border: 1px solid #ccc;
-  padding: 4px 6px;
-  text-align: left;
-}
-th {
-  background: #f3f4f6;
-}
+body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; font-size: 12px; padding: 16px; }
+h1 { font-size: 18px; margin-bottom: 4px; }
+p { margin: 0 0 8px 0; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; }
+th { background: #f3f4f6; }
 </style>
 </head>
 <body>
@@ -627,17 +576,9 @@ th {
 <table>
 <thead>
 <tr>
-  <th>Category</th>
-  <th>Type</th>
-  <th>Item Name</th>
-  <th>Location</th>
-  <th>TE Number</th>
-  <th>Quantity</th>
-  <th>Unit Price</th>
-  <th>Total Value</th>
-  <th>Last Verification Date</th>
-  <th>Last Verification Qty</th>
-  <th>Last Verification Age (days)</th>
+  <th>Category</th><th>Type</th><th>Item Name</th><th>Location</th><th>TE Number</th>
+  <th>Quantity</th><th>Unit Price</th><th>Total Value</th>
+  <th>Last Verification Date</th><th>Last Verification Qty</th><th>Last Verification Age (days)</th>
 </tr>
 </thead>
 <tbody>
@@ -656,28 +597,34 @@ ${tableRows}
     win.print();
   };
 
-  // ---------- RENDER ----------
+  if (companyLoading || loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-slate-500">
+        Loading…
+      </div>
+    );
+  }
 
+  // ---------- RENDER ----------
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur">
+      <header className="border-b border-slate-200 bg-white">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
           <Link
             href="/"
-            className="flex items-center gap-2 text-sm text-slate-300 hover:text-white"
+            className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900"
           >
             <ArrowLeft className="w-4 h-4" />
-            Back to Stokstak
+            Back to dashboard
           </Link>
 
           <div className="flex items-center gap-4">
-            {/* Export buttons in header */}
             <div className="hidden sm:flex items-center gap-2">
               <button
                 type="button"
                 onClick={handleExportExcel}
-                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50"
               >
                 <FileSpreadsheet className="w-4 h-4" />
                 Excel (CSV)
@@ -685,7 +632,7 @@ ${tableRows}
               <button
                 type="button"
                 onClick={handleExportPdf}
-                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50"
               >
                 <FileText className="w-4 h-4" />
                 PDF
@@ -693,14 +640,12 @@ ${tableRows}
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="bg-gradient-to-br from-indigo-500 to-purple-500 p-2 rounded-xl shadow-lg shadow-indigo-500/30">
+              <div className="bg-gradient-to-br from-indigo-600 to-purple-600 p-2 rounded-xl">
                 <BarChart3 className="w-5 h-5 text-white" />
               </div>
               <div>
-                <p className="text-sm font-semibold text-slate-50">
-                  Inventory Intelligence
-                </p>
-                <p className="text-xs text-slate-400">
+                <p className="text-sm font-semibold">Inventory Intelligence</p>
+                <p className="text-xs text-slate-500">
                   Financial & operational overview
                 </p>
               </div>
@@ -709,14 +654,13 @@ ${tableRows}
         </div>
       </header>
 
-      {/* Main */}
       <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
         {/* Mobile export buttons */}
-        <div className="sm:hidden flex gap-2 mb-2">
+        <div className="sm:hidden flex gap-2">
           <button
             type="button"
             onClick={handleExportExcel}
-            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-2 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50"
           >
             <FileSpreadsheet className="w-4 h-4" />
             Excel (CSV)
@@ -724,7 +668,7 @@ ${tableRows}
           <button
             type="button"
             onClick={handleExportPdf}
-            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-100 hover:border-slate-500"
+            className="flex-1 inline-flex items-center justify-center gap-1 px-3 py-2 rounded-lg border border-slate-200 text-xs text-slate-700 hover:bg-slate-50"
           >
             <FileText className="w-4 h-4" />
             PDF
@@ -732,17 +676,17 @@ ${tableRows}
         </div>
 
         {errorMsg && (
-          <div className="rounded-xl border border-red-500/40 bg-red-950/60 px-3 py-2 text-sm text-red-100 flex items-center gap-2">
+          <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center gap-2">
             <AlertCircle className="w-4 h-4" />
             <span>{errorMsg}</span>
           </div>
         )}
 
-        {/* KPI row */}
-        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+        {/* KPI row (rearranged, low stock removed) */}
+        <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 flex items-center justify-between">
             <div>
-              <p className="text-xs text-slate-400 mb-1">Total Value</p>
+              <p className="text-xs text-slate-500 mb-1">Total Value</p>
               <p className="text-2xl font-semibold">
                 {formatCurrency(overall.totalValue)}
               </p>
@@ -750,55 +694,34 @@ ${tableRows}
                 Avg unit value {formatCurrency(overall.avgUnitValue || 0)}
               </p>
             </div>
-            <div className="bg-emerald-500/10 p-3 rounded-xl">
-              <DollarSign className="w-6 h-6 text-emerald-400" />
+            <div className="bg-emerald-50 p-3 rounded-xl">
+              <DollarSign className="w-6 h-6 text-emerald-600" />
             </div>
           </div>
 
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 flex items-center justify-between">
             <div>
-              <p className="text-xs text-slate-400 mb-1">Total Quantity</p>
+              <p className="text-xs text-slate-500 mb-1">Total Items</p>
               <p className="text-2xl font-semibold">{overall.totalQty}</p>
               <p className="text-[11px] text-slate-500 mt-1">
-                Across {overall.categories} categories
+                Sum of all quantities
               </p>
             </div>
-            <div className="bg-blue-500/10 p-3 rounded-xl">
-              <Package className="w-6 h-6 text-blue-400" />
-            </div>
-          </div>
-
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
-            <div>
-              <p className="text-xs text-slate-400 mb-1">
-                Low Stock (&lt; {LOW_STOCK_THRESHOLD})
-              </p>
-              <p className="text-2xl font-semibold">
-                {overall.lowStockCount}
-              </p>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Potential purchase candidates
-              </p>
-            </div>
-            <div className="bg-amber-500/10 p-3 rounded-xl">
-              <Activity className="w-6 h-6 text-amber-400" />
+            <div className="bg-blue-50 p-3 rounded-xl">
+              <Package className="w-6 h-6 text-blue-600" />
             </div>
           </div>
 
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 shadow-sm flex items-center justify-between">
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 flex items-center justify-between">
             <div>
-              <p className="text-xs text-slate-400 mb-1">
-                Verification Risk (&gt; {VERIFICATION_STALE_DAYS} days)
-              </p>
-              <p className="text-2xl font-semibold">
-                {overall.staleOrNeverVerifiedCount}
-              </p>
+              <p className="text-xs text-slate-500 mb-1">Categories</p>
+              <p className="text-2xl font-semibold">{overall.categories}</p>
               <p className="text-[11px] text-slate-500 mt-1">
-                Items needing physical check
+                Grouped reporting view
               </p>
             </div>
-            <div className="bg-rose-500/10 p-3 rounded-xl">
-              <Clock className="w-6 h-6 text-rose-400" />
+            <div className="bg-purple-50 p-3 rounded-xl">
+              <Layers className="w-6 h-6 text-purple-600" />
             </div>
           </div>
         </section>
@@ -806,10 +729,10 @@ ${tableRows}
         {/* Management insights row */}
         <section className="grid grid-cols-1 lg:grid-cols-3 gap-4">
           {/* Top categories by value */}
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs font-semibold text-slate-300">
+                <p className="text-xs font-semibold text-slate-700">
                   Top Categories by Value
                 </p>
                 <p className="text-[11px] text-slate-500">
@@ -829,15 +752,17 @@ ${tableRows}
                       : 0;
                   return (
                     <div key={cat.category} className="space-y-1">
-                      <div className="flex justify-between text-[11px] text-slate-400">
-                        <span className="font-medium text-slate-200">
+                      <div className="flex justify-between text-[11px] text-slate-500">
+                        <span className="font-medium text-slate-800">
                           {cat.category}
                         </span>
-                        <span>{formatCurrency(cat.totalValue)}</span>
+                        <span className="text-slate-800">
+                          {formatCurrency(cat.totalValue)}
+                        </span>
                       </div>
-                      <div className="h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                      <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden">
                         <div
-                          className="h-full bg-gradient-to-r from-indigo-400 to-sky-400"
+                          className="h-full bg-indigo-500"
                           style={{ width: `${Math.min(pct, 100)}%` }}
                         />
                       </div>
@@ -849,10 +774,10 @@ ${tableRows}
           </div>
 
           {/* High-value items */}
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs font-semibold text-slate-300">
+                <p className="text-xs font-semibold text-slate-700">
                   Highest Value Items
                 </p>
                 <p className="text-[11px] text-slate-500">
@@ -865,14 +790,14 @@ ${tableRows}
               <p className="text-xs text-slate-500">No data.</p>
             ) : (
               <ul className="space-y-2 text-xs">
-                {topItemsByValue.map((it) => (
+                {topItemsByValue.map((it: any) => (
                   <li
                     key={it.id}
-                    className="flex items-center justify-between border border-slate-800/70 rounded-xl px-3 py-2 hover:bg-slate-800/60 cursor-pointer"
+                    className="flex items-center justify-between border border-slate-200 rounded-xl px-3 py-2 hover:bg-slate-50 cursor-pointer"
                     onClick={() => handleOpenItem(it)}
                   >
                     <div className="flex flex-col">
-                      <span className="font-medium text-slate-100">
+                      <span className="font-medium text-slate-900">
                         {it.name}
                       </span>
                       <span className="text-[11px] text-slate-500">
@@ -880,10 +805,8 @@ ${tableRows}
                       </span>
                     </div>
                     <div className="text-right">
-                      <p className="text-sm font-semibold text-slate-50">
-                        {formatCurrency(
-                          (it.purchase_price || 0) * it.quantity
-                        )}
+                      <p className="text-sm font-semibold text-slate-900">
+                        {formatCurrency((it.purchase_price || 0) * it.quantity)}
                       </p>
                       <p className="text-[11px] text-slate-500">
                         {formatCurrency(it.purchase_price || 0)} / unit
@@ -895,94 +818,57 @@ ${tableRows}
             )}
           </div>
 
-          {/* Risk & action list */}
-          <div className="bg-slate-900/80 rounded-2xl p-4 border border-slate-800 space-y-3">
+          {/* Verification risk list */}
+          <div className="bg-white rounded-2xl p-4 border border-slate-200 space-y-3">
             <div className="flex items-center justify-between">
               <div>
-                <p className="text-xs font-semibold text-slate-300">
-                  Action List
+                <p className="text-xs font-semibold text-slate-700">
+                  Verification Risk
                 </p>
                 <p className="text-[11px] text-slate-500">
-                  Low stock & verification risk
+                  Items needing a physical check
                 </p>
               </div>
-              <Activity className="w-4 h-4 text-slate-400" />
+              <Clock className="w-4 h-4 text-slate-400" />
             </div>
 
-            <div className="space-y-2">
-              <p className="text-[11px] text-slate-400 font-semibold">
-                Low Stock (Reorder)
+            {staleVerificationItems.length === 0 ? (
+              <p className="text-xs text-slate-500">
+                All items recently verified or no items.
               </p>
-              {lowStockItems.length === 0 ? (
-                <p className="text-[11px] text-slate-500">
-                  No low stock items.
-                </p>
-              ) : (
-                <ul className="space-y-1 text-xs">
-                  {lowStockItems.map((it) => (
+            ) : (
+              <ul className="space-y-1 text-xs">
+                {staleVerificationItems.map((it) => {
+                  const lv = lastVerifications[it.id];
+                  const badge = lv ? `${daysSince(lv.verified_at)} days` : "Never";
+                  return (
                     <li
                       key={it.id}
-                      className="flex justify-between items-center px-2 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800/80 cursor-pointer"
+                      className="flex justify-between items-center px-2 py-2 rounded-lg bg-slate-50 hover:bg-slate-100 cursor-pointer"
                       onClick={() => handleOpenItem(it)}
                     >
-                      <span className="truncate max-w-[60%]">
+                      <span className="truncate max-w-[70%] text-slate-800">
                         {it.name}
                       </span>
-                      <span className="text-[11px] text-amber-300">
-                        Qty {it.quantity}
-                      </span>
+                      <span className="text-[11px] text-rose-700">{badge}</span>
                     </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            <div className="space-y-2 pt-2 border-t border-slate-800/60">
-              <p className="text-[11px] text-slate-400 font-semibold">
-                Verification Overdue
-              </p>
-              {staleVerificationItems.length === 0 ? (
-                <p className="text-[11px] text-slate-500">
-                  All items recently verified or no items.
-                </p>
-              ) : (
-                <ul className="space-y-1 text-xs">
-                  {staleVerificationItems.map((it) => {
-                    const lv = lastVerifications[it.id];
-                    const badge = lv
-                      ? `${daysSince(lv.verified_at)} days`
-                      : "Never";
-                    return (
-                      <li
-                        key={it.id}
-                        className="flex justify-between items-center px-2 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-800/80 cursor-pointer"
-                        onClick={() => handleOpenItem(it)}
-                      >
-                        <span className="truncate max-w-[60%]">
-                          {it.name}
-                        </span>
-                        <span className="text-[11px] text-rose-300">
-                          {badge}
-                        </span>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </div>
+                  );
+                })}
+              </ul>
+            )}
           </div>
         </section>
 
         {/* Filters */}
-        <section className="bg-slate-900/80 border border-slate-800 rounded-2xl p-4 shadow-sm flex flex-wrap gap-4 items-end">
+        <section className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm flex flex-wrap gap-4 items-end">
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-300 mb-1">
+            <label className="text-xs font-medium text-slate-600 mb-1">
               Category
             </label>
             <select
               value={filterCategory}
               onChange={(e) => setFilterCategory(e.target.value)}
-              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
+              className="px-3 py-2 border border-slate-200 bg-white rounded-lg text-sm"
             >
               <option value="all">All</option>
               {categoryOptions.map((cat) => (
@@ -994,13 +880,13 @@ ${tableRows}
           </div>
 
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-300 mb-1">
+            <label className="text-xs font-medium text-slate-600 mb-1">
               Location
             </label>
             <select
               value={filterLocation}
               onChange={(e) => setFilterLocation(e.target.value)}
-              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
+              className="px-3 py-2 border border-slate-200 bg-white rounded-lg text-sm"
             >
               <option value="all">All</option>
               {locationOptions.map((loc) => (
@@ -1012,13 +898,13 @@ ${tableRows}
           </div>
 
           <div className="flex flex-col">
-            <label className="text-xs font-medium text-slate-300 mb-1">
+            <label className="text-xs font-medium text-slate-600 mb-1">
               Type
             </label>
             <select
               value={filterType}
               onChange={(e) => setFilterType(e.target.value)}
-              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100"
+              className="px-3 py-2 border border-slate-200 bg-white rounded-lg text-sm"
             >
               <option value="all">All</option>
               {typeOptions.map((t) => (
@@ -1030,7 +916,7 @@ ${tableRows}
           </div>
 
           <div className="flex flex-col flex-1 min-w-[180px]">
-            <label className="text-xs font-medium text-slate-300 mb-1">
+            <label className="text-xs font-medium text-slate-600 mb-1">
               Search (name or TE#)
             </label>
             <input
@@ -1038,44 +924,40 @@ ${tableRows}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="e.g. Hilti, TE-045"
-              className="px-3 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-sm text-slate-100 placeholder:text-slate-500"
+              className="px-3 py-2 border border-slate-200 bg-white rounded-lg text-sm placeholder:text-slate-400"
             />
           </div>
         </section>
 
         {/* Groups by category */}
         <section className="space-y-4">
-          {loading ? (
-            <div className="bg-slate-900/80 rounded-2xl border border-slate-800 shadow-sm p-6 text-center text-slate-400">
-              Building report...
-            </div>
-          ) : filteredGroups.length === 0 ? (
-            <div className="bg-slate-900/80 rounded-2xl border border-slate-800 shadow-sm p-6 text-center text-slate-400">
+          {filteredGroups.length === 0 ? (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 text-center text-slate-500">
               No inventory data matches the current filters.
             </div>
           ) : (
             filteredGroups.map((g) => (
               <div
                 key={g.category}
-                className="bg-slate-900/80 rounded-2xl shadow-sm border border-slate-800 overflow-hidden"
+                className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden"
               >
-                <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 bg-slate-950/70">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 bg-slate-50">
                   <div className="flex items-center gap-2">
-                    <Tag className="w-4 h-4 text-purple-400" />
-                    <h2 className="text-sm font-semibold text-slate-50">
+                    <Tag className="w-4 h-4 text-purple-600" />
+                    <h2 className="text-sm font-semibold text-slate-900">
                       {g.category}
                     </h2>
                   </div>
-                  <div className="flex items-center gap-4 text-xs text-slate-400">
+                  <div className="flex items-center gap-4 text-xs text-slate-600">
                     <span>
                       Qty:{" "}
-                      <span className="font-semibold text-slate-50">
+                      <span className="font-semibold text-slate-900">
                         {g.totalQty}
                       </span>
                     </span>
                     <span>
                       Value:{" "}
-                      <span className="font-semibold text-slate-50">
+                      <span className="font-semibold text-slate-900">
                         {formatCurrency(g.totalValue)}
                       </span>
                     </span>
@@ -1084,8 +966,8 @@ ${tableRows}
 
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs">
-                    <thead className="bg-slate-950 border-b border-slate-800">
-                      <tr className="text-left text-[11px] text-slate-400">
+                    <thead className="bg-white border-b border-slate-200">
+                      <tr className="text-left text-[11px] text-slate-600">
                         <th className="px-3 py-2">Item</th>
                         <th className="px-3 py-2">Type</th>
                         <th className="px-3 py-2">Location</th>
@@ -1105,14 +987,14 @@ ${tableRows}
                           <tr
                             key={it.id}
                             onClick={() => handleOpenItem(it)}
-                            className="border-b border-slate-800 last:border-0 hover:bg-slate-800/60 cursor-pointer"
+                            className="border-b border-slate-200 last:border-0 hover:bg-slate-50 cursor-pointer"
                           >
                             <td className="px-3 py-2 align-top">
                               <div className="flex flex-col gap-0.5">
-                                <span className="font-medium text-slate-50">
+                                <span className="font-medium text-slate-900">
                                   {it.name}
                                 </span>
-                                <span className="text-[11px] text-slate-400">
+                                <span className="text-[11px] text-slate-500">
                                   {lastVerText}
                                 </span>
                                 {it.description && (
@@ -1122,25 +1004,25 @@ ${tableRows}
                                 )}
                               </div>
                             </td>
-                            <td className="px-3 py-2 align-top text-[11px] text-slate-300">
+                            <td className="px-3 py-2 align-top text-[11px] text-slate-700">
                               {it.type || "Unspecified"}
                             </td>
                             <td className="px-3 py-2 align-top">
-                              <div className="inline-flex items-center gap-1 text-slate-300">
+                              <div className="inline-flex items-center gap-1 text-slate-700">
                                 <MapPin className="w-3 h-3" />
                                 <span>{it.location || "-"}</span>
                               </div>
                             </td>
-                            <td className="px-3 py-2 align-top text-[11px] text-slate-400">
+                            <td className="px-3 py-2 align-top text-[11px] text-slate-500">
                               {it.te_number || "-"}
                             </td>
-                            <td className="px-3 py-2 align-top text-right text-slate-50">
+                            <td className="px-3 py-2 align-top text-right text-slate-900">
                               {it.quantity}
                             </td>
-                            <td className="px-3 py-2 align-top text-right text-slate-50">
+                            <td className="px-3 py-2 align-top text-right text-slate-900">
                               {unit ? formatCurrency(unit) : "-"}
                             </td>
-                            <td className="px-3 py-2 align-top text-right font-semibold text-slate-50">
+                            <td className="px-3 py-2 align-top text-right font-semibold text-slate-900">
                               {total ? formatCurrency(total) : "-"}
                             </td>
                           </tr>
@@ -1158,19 +1040,19 @@ ${tableRows}
       {/* Item detail + verification modal */}
       {selectedItem && (
         <div
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4"
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center z-50 p-4"
           onClick={() => setSelectedItem(null)}
         >
           <div
-            className="bg-slate-950 rounded-2xl border border-slate-800 shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto"
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-3xl w-full max-h-[90vh] overflow-y-auto"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-800 bg-slate-950 sticky top-0 z-10">
+            <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 bg-white sticky top-0 z-10">
               <div>
-                <h2 className="text-sm font-semibold text-slate-50">
+                <h2 className="text-sm font-semibold text-slate-900">
                   {selectedItem.name}
                 </h2>
-                <p className="text-[11px] text-slate-400">
+                <p className="text-[11px] text-slate-500">
                   TE#: {selectedItem.te_number || "-"}
                 </p>
                 <p className="text-[11px] text-slate-500">
@@ -1179,9 +1061,9 @@ ${tableRows}
               </div>
               <button
                 onClick={() => setSelectedItem(null)}
-                className="p-2 rounded-lg hover:bg-slate-800"
+                className="p-2 rounded-lg hover:bg-slate-100"
               >
-                <X className="w-4 h-4 text-slate-300" />
+                <X className="w-4 h-4 text-slate-600" />
               </button>
             </div>
 
@@ -1189,10 +1071,10 @@ ${tableRows}
               {/* Photos */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <p className="text-[11px] font-semibold text-slate-400 mb-1 uppercase">
+                  <p className="text-[11px] font-semibold text-slate-500 mb-1 uppercase">
                     Primary Photo
                   </p>
-                  <div className="aspect-square rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex items-center justify-center">
+                  <div className="aspect-square rounded-xl border border-slate-200 bg-slate-50 overflow-hidden flex items-center justify-center">
                     {selectedItem.image_url ? (
                       <img
                         src={selectedItem.image_url}
@@ -1200,15 +1082,15 @@ ${tableRows}
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <FileImage className="w-10 h-10 text-slate-600" />
+                      <FileImage className="w-10 h-10 text-slate-300" />
                     )}
                   </div>
                 </div>
                 <div>
-                  <p className="text-[11px] font-semibold text-slate-400 mb-1 uppercase">
+                  <p className="text-[11px] font-semibold text-slate-500 mb-1 uppercase">
                     Secondary Photo
                   </p>
-                  <div className="aspect-square rounded-xl border border-slate-800 bg-slate-900 overflow-hidden flex items-center justify-center">
+                  <div className="aspect-square rounded-xl border border-slate-200 bg-slate-50 overflow-hidden flex items-center justify-center">
                     {selectedItem.image_url_2 ? (
                       <img
                         src={selectedItem.image_url_2}
@@ -1216,19 +1098,17 @@ ${tableRows}
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <FileImage className="w-10 h-10 text-slate-600" />
+                      <FileImage className="w-10 h-10 text-slate-300" />
                     )}
                   </div>
                 </div>
               </div>
 
               {/* Details */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-slate-900 rounded-xl p-4 border border-slate-800">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 bg-slate-50 rounded-xl p-4 border border-slate-200">
                 <div>
-                  <p className="text-[11px] text-slate-500 mb-1 uppercase">
-                    Type
-                  </p>
-                  <p className="text-sm font-medium text-slate-50">
+                  <p className="text-[11px] text-slate-500 mb-1 uppercase">Type</p>
+                  <p className="text-sm font-medium text-slate-900">
                     {selectedItem.type || "Unspecified"}
                   </p>
                 </div>
@@ -1236,7 +1116,7 @@ ${tableRows}
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Category
                   </p>
-                  <p className="text-sm font-medium text-slate-50">
+                  <p className="text-sm font-medium text-slate-900">
                     {selectedItem.category || "Uncategorized"}
                   </p>
                 </div>
@@ -1244,7 +1124,7 @@ ${tableRows}
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Location
                   </p>
-                  <p className="text-sm font-medium text-slate-50">
+                  <p className="text-sm font-medium text-slate-900">
                     {selectedItem.location || "-"}
                   </p>
                 </div>
@@ -1252,7 +1132,7 @@ ${tableRows}
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Quantity
                   </p>
-                  <p className="text-lg font-semibold text-slate-50">
+                  <p className="text-lg font-semibold text-slate-900">
                     {selectedItem.quantity}
                   </p>
                 </div>
@@ -1260,7 +1140,7 @@ ${tableRows}
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Unit Price
                   </p>
-                  <p className="text-lg font-semibold text-slate-50">
+                  <p className="text-lg font-semibold text-slate-900">
                     {selectedItem.purchase_price
                       ? formatCurrency(selectedItem.purchase_price)
                       : "$0.00"}
@@ -1270,18 +1150,18 @@ ${tableRows}
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Purchase Date
                   </p>
-                  <p className="text-sm font-medium text-slate-50">
+                  <p className="text-sm font-medium text-slate-900">
                     {selectedItem.purchase_date || "-"}
                   </p>
                 </div>
               </div>
 
               {selectedItem.description && (
-                <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
+                <div className="bg-white rounded-xl border border-slate-200 p-4">
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Description
                   </p>
-                  <p className="text-sm text-slate-100">
+                  <p className="text-sm text-slate-900">
                     {selectedItem.description}
                   </p>
                 </div>
@@ -1289,69 +1169,66 @@ ${tableRows}
 
               {/* Latest verification photo (if any) */}
               {lastVerifications[selectedItem.id]?.photo_url && (
-                <div className="bg-slate-900 rounded-xl border border-slate-800 p-4">
+                <div className="bg-white rounded-xl border border-slate-200 p-4">
                   <p className="text-[11px] text-slate-500 mb-1 uppercase">
                     Latest Verification Photo
                   </p>
                   <div className="w-full max-w-xs">
                     <img
-                      src={
-                        lastVerifications[selectedItem.id]
-                          ?.photo_url as string
-                      }
+                      src={lastVerifications[selectedItem.id]?.photo_url as string}
                       alt="Latest verification"
-                      className="w-full h-auto rounded-lg border border-slate-800"
+                      className="w-full h-auto rounded-lg border border-slate-200"
                     />
                   </div>
                 </div>
               )}
 
               {/* Add verification block */}
-              <div className="bg-slate-900 rounded-xl border border-slate-800 p-4 space-y-3">
+              <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3">
                 <p className="text-[11px] text-slate-500 mb-1 uppercase">
                   Add Stock Verification
                 </p>
+
                 {verificationError && (
-                  <div className="text-xs text-rose-300 flex items-center gap-1">
+                  <div className="text-xs text-rose-700 flex items-center gap-1">
                     <AlertCircle className="w-3 h-3" />
                     {verificationError}
                   </div>
                 )}
                 {verificationSuccess && (
-                  <div className="text-xs text-emerald-300 flex items-center gap-1">
+                  <div className="text-xs text-emerald-700 flex items-center gap-1">
                     <CheckCircle2 className="w-3 h-3" />
                     Verification saved.
                   </div>
                 )}
+
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                   <div>
-                    <label className="block text-slate-300 mb-1">
+                    <label className="block text-slate-600 mb-1">
                       Verification Date
                     </label>
                     <input
                       type="date"
                       value={verDate}
                       onChange={(e) => setVerDate(e.target.value)}
-                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100"
+                      className="w-full px-2 py-2 border border-slate-200 rounded-lg"
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-300 mb-1">
+                    <label className="block text-slate-600 mb-1">
                       Verified Quantity
                     </label>
                     <input
                       type="number"
                       value={verQty}
                       onChange={(e) =>
-                        setVerQty(
-                          e.target.value === "" ? "" : Number(e.target.value)
-                        )
+                        setVerQty(e.target.value === "" ? "" : Number(e.target.value))
                       }
-                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100"
+                      className="w-full px-2 py-2 border border-slate-200 rounded-lg"
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-300 mb-1">
+                    <label className="block text-slate-600 mb-1">
                       Notes (optional)
                     </label>
                     <input
@@ -1359,22 +1236,20 @@ ${tableRows}
                       value={verNotes}
                       onChange={(e) => setVerNotes(e.target.value)}
                       placeholder="Counted in MER container..."
-                      className="w-full px-2 py-1.5 border border-slate-700 bg-slate-950 rounded-lg text-slate-100 placeholder:text-slate-500"
+                      className="w-full px-2 py-2 border border-slate-200 rounded-lg placeholder:text-slate-400"
                     />
                   </div>
                 </div>
 
                 {/* Verification photo upload */}
                 <div className="mt-3 text-xs">
-                  <label className="block text-slate-300 mb-1">
+                  <label className="block text-slate-600 mb-1">
                     Verification Photo (optional)
                   </label>
-                  <label className="inline-flex items-center gap-2 px-3 py-2 border border-dashed border-slate-700 rounded-lg cursor-pointer hover:border-slate-500">
-                    <Upload className="w-4 h-4 text-slate-200" />
-                    <span className="text-slate-100">
-                      {verPhotoUrl
-                        ? "Change verification photo"
-                        : "Upload verification photo"}
+                  <label className="inline-flex items-center gap-2 px-3 py-2 border border-dashed border-slate-200 rounded-lg cursor-pointer hover:bg-slate-50">
+                    <Upload className="w-4 h-4 text-slate-700" />
+                    <span className="text-slate-700">
+                      {verPhotoUrl ? "Change verification photo" : "Upload verification photo"}
                     </span>
                     <input
                       type="file"
@@ -1383,12 +1258,13 @@ ${tableRows}
                       onChange={handleVerPhotoChange}
                     />
                   </label>
+
                   {verPhotoUrl && (
                     <div className="mt-2 max-w-xs">
                       <img
                         src={verPhotoUrl}
                         alt="Verification preview"
-                        className="w-full h-auto rounded-md border border-slate-700"
+                        className="w-full h-auto rounded-md border border-slate-200"
                       />
                     </div>
                   )}
@@ -1399,7 +1275,7 @@ ${tableRows}
                     type="button"
                     onClick={handleAddVerification}
                     disabled={savingVerification}
-                    className="px-4 py-1.5 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 disabled:opacity-60 flex items-center gap-1"
+                    className="px-4 py-2 text-xs bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-60 flex items-center gap-1"
                   >
                     <CheckCircle2 className="w-3 h-3" />
                     {savingVerification ? "Saving..." : "Save Verification"}
