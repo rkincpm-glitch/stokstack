@@ -659,7 +659,7 @@ ${tableRows}
   // ---------- RENDER ----------
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-50">
+    <div className="min-h-screen bg-slate-50 text-slate-900">
       {/* Header */}
       <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur">
         <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">

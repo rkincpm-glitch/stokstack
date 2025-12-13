@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState, ChangeEvent } from "react";
+import { FormEvent, useEffect, useState, ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -15,7 +15,6 @@ import {
   Settings2,
   X,
   AlertCircle,
-  Loader2,
 } from "lucide-react";
 
 const ADD_CATEGORY = "__ADD_CATEGORY__";
@@ -35,10 +34,39 @@ interface ItemType {
   name: string;
 }
 
+function withTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("Request timed out")), ms);
+    p.then((v) => {
+      clearTimeout(t);
+      resolve(v);
+    }).catch((e) => {
+      clearTimeout(t);
+      reject(e);
+    });
+  });
+}
+
+async function safeInsertMaster(
+  table: "categories" | "locations" | "item_types",
+  payload: any
+) {
+  // Try with user_id; if column doesn't exist, retry without it
+  const first = await supabase.from(table).insert(payload).select("id,name").single();
+  if (!first.error) return first;
+
+  const msg = first.error?.message?.toLowerCase() || "";
+  if (msg.includes('column "user_id"') || msg.includes("user_id")) {
+    const { user_id, ...rest } = payload;
+    return await supabase.from(table).insert(rest).select("id,name").single();
+  }
+  return first;
+}
+
 export default function AddItemPage() {
   const router = useRouter();
-  const [userId, setUserId] = useState<string | null>(null);
 
+  const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -47,11 +75,11 @@ export default function AddItemPage() {
 
   const [form, setForm] = useState({
     name: "",
-    teNumber: "", // optional
+    teNumber: "",
     description: "",
     type: "",
-    category: "", // REQUIRED
-    location: "", // REQUIRED
+    category: "",
+    location: "",
     quantity: "" as number | "",
     purchasePrice: "" as number | "",
     purchaseDate: new Date().toISOString().slice(0, 10),
@@ -71,78 +99,48 @@ export default function AddItemPage() {
     setForm((f) => ({ ...f, [key]: value }));
   };
 
-  const isFormValid = useMemo(() => {
-    return (
-      form.name.trim().length > 0 &&
-      form.category.trim().length > 0 &&
-      form.location.trim().length > 0 &&
-      form.quantity !== "" &&
-      Number(form.quantity) > 0
-    );
-  }, [form]);
-
-  // ---------- init ----------
   useEffect(() => {
-    let cancelled = false;
-
-    async function init() {
+    const init = async () => {
       setLoading(true);
       setError(null);
 
       try {
-        const { data, error: authError } = await supabase.auth.getUser();
-        if (authError) console.error("Auth error:", authError);
+        const authRes = await withTimeout(supabase.auth.getUser(), 12000);
+        const user = authRes.data?.user;
 
-        const user = data?.user;
         if (!user) {
-          // IMPORTANT: release loading before redirect
-          if (!cancelled) setLoading(false);
           router.replace("/auth");
           return;
         }
-
-        if (cancelled) return;
         setUserId(user.id);
 
-        // Load master data one-by-one so we can see the real failing point
-        const cats = await supabase.from("categories").select("id,name").order("name");
-        if (cats.error) {
-          console.error("Categories load error:", cats.error);
-          if (!cancelled) setError(`Categories load failed: ${cats.error.message}`);
-        } else if (!cancelled) {
-          setCategories((cats.data || []) as Category[]);
-        }
+        const [cats, locs, types] = await Promise.all([
+          supabase.from("categories").select("id,name").order("name"),
+          supabase.from("locations").select("id,name").order("name"),
+          supabase.from("item_types").select("id,name").order("name"),
+        ]);
 
-        const locs = await supabase.from("locations").select("id,name").order("name");
-        if (locs.error) {
-          console.error("Locations load error:", locs.error);
-          if (!cancelled) setError((prev) => prev ?? `Locations load failed: ${locs.error.message}`);
-        } else if (!cancelled) {
-          setLocations((locs.data || []) as Location[]);
-        }
+        if (cats.error) throw cats.error;
+        if (locs.error) throw locs.error;
+        if (types.error) throw types.error;
 
-        const types = await supabase.from("item_types").select("id,name").order("name");
-        if (types.error) {
-          console.error("Item types load error:", types.error);
-          // types are optional; do not block page
-        } else if (!cancelled) {
-          setItemTypes((types.data || []) as ItemType[]);
-        }
-      } catch (err: any) {
-        console.error("Init crash:", err);
-        if (!cancelled) setError(`Init crash: ${err?.message || "Unknown error"}`);
+        setCategories((cats.data || []) as Category[]);
+        setLocations((locs.data || []) as Location[]);
+        setItemTypes((types.data || []) as ItemType[]);
+      } catch (e: any) {
+        console.error(e);
+        setError(
+          e?.message ||
+            "Failed to load master data. Check Supabase RLS policies for categories/locations/item_types."
+        );
       } finally {
-        if (!cancelled) setLoading(false);
+        setLoading(false);
       }
-    }
+    };
 
     void init();
-    return () => {
-      cancelled = true;
-    };
   }, [router]);
 
-  // ---------- add master ----------
   const addMasterItem = async (
     table: "categories" | "locations" | "item_types",
     name: string
@@ -150,30 +148,21 @@ export default function AddItemPage() {
     if (!userId || !name.trim()) return null;
 
     setError(null);
+    const payload = { name: name.trim(), user_id: userId };
 
-    // Try insert WITH user_id first (in case your table has it)
-    let res = await supabase
-      .from(table)
-      .insert({ name: name.trim(), user_id: userId } as any)
-      .select("id,name")
-      .single();
-
-    // If that fails because column doesn't exist, retry without user_id
-    if (res.error && /user_id/i.test(res.error.message)) {
-      res = await supabase
-        .from(table)
-        .insert({ name: name.trim() } as any)
-        .select("id,name")
-        .single();
-    }
-
-    if (res.error || !res.data) {
-      console.error(`Failed to add ${table}:`, res.error);
-      setError(`Failed to add ${table}: ${res.error?.message || "Unknown error"}`);
+    const { data, error } = await safeInsertMaster(table, payload);
+    if (error || !data) {
+      console.error(error);
+      setError(`Failed to add ${table}. ${error?.message || ""}`);
       return null;
     }
 
-    return res.data as { id: string; name: string };
+    const row = data as { id: string; name: string };
+    if (table === "categories") setCategories((p) => [...p, row]);
+    if (table === "locations") setLocations((p) => [...p, row]);
+    if (table === "item_types") setItemTypes((p) => [...p, row]);
+
+    return row;
   };
 
   const handleCategoryChange = async (value: string) => {
@@ -181,10 +170,7 @@ export default function AddItemPage() {
       const name = prompt("Enter new category name:");
       if (!name?.trim()) return;
       const added = await addMasterItem("categories", name);
-      if (added) {
-        setCategories((prev) => [...prev, added]);
-        updateForm("category", added.name);
-      }
+      if (added) updateForm("category", added.name);
       return;
     }
     updateForm("category", value);
@@ -195,10 +181,7 @@ export default function AddItemPage() {
       const name = prompt("Enter new location name:");
       if (!name?.trim()) return;
       const added = await addMasterItem("locations", name);
-      if (added) {
-        setLocations((prev) => [...prev, added]);
-        updateForm("location", added.name);
-      }
+      if (added) updateForm("location", added.name);
       return;
     }
     updateForm("location", value);
@@ -209,52 +192,50 @@ export default function AddItemPage() {
       const name = prompt("Enter new type (e.g. Tool, Equipment, Material):");
       if (!name?.trim()) return;
       const added = await addMasterItem("item_types", name);
-      if (added) {
-        setItemTypes((prev) => [...prev, added]);
-        updateForm("type", added.name);
-      }
+      if (added) updateForm("type", added.name);
       return;
     }
     updateForm("type", value);
   };
 
-  // ---------- uploads ----------
-  const uploadImage = async (file: File, type: "primary" | "secondary") => {
+  const uploadImage = async (file: File, which: "primary" | "secondary") => {
     if (!userId) return;
 
     try {
-      setError(null);
       const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
-      const fileName = `${Date.now()}-${type}.${ext}`;
+      const fileName = `${Date.now()}-${which}.${ext}`;
       const path = `${userId}/items/${fileName}`;
 
       const { error: uploadError } = await supabase.storage
         .from("item-images")
         .upload(path, file, { upsert: false });
 
-      if (uploadError) throw uploadError;
+      if (uploadError) {
+        setError(`Image upload failed: ${uploadError.message}`);
+        return;
+      }
 
       const { data } = supabase.storage.from("item-images").getPublicUrl(path);
-      const url = data.publicUrl;
-
-      if (type === "primary") setImageUrl(url);
-      else setImageUrl2(url);
-    } catch (err: any) {
-      console.error(err);
-      setError(`Image upload failed: ${err?.message || "Unknown error"}`);
+      if (which === "primary") setImageUrl(data.publicUrl);
+      else setImageUrl2(data.publicUrl);
+    } catch (e: any) {
+      console.error(e);
+      setError("Unexpected error while uploading image.");
     }
   };
 
-  const handleImageChange = (e: ChangeEvent<HTMLInputElement>, type: "primary" | "secondary") => {
+  const handleImageChange = (
+    e: ChangeEvent<HTMLInputElement>,
+    which: "primary" | "secondary"
+  ) => {
     const file = e.target.files?.[0];
-    if (file) void uploadImage(file, type);
+    if (file) void uploadImage(file, which);
   };
 
   const uploadVerificationPhoto = async (file: File) => {
     if (!userId) return;
 
     try {
-      setError(null);
       const ext = file.name.split(".").pop()?.toLowerCase() || "jpg";
       const fileName = `${Date.now()}-verification.${ext}`;
       const path = `${userId}/verifications/${fileName}`;
@@ -263,13 +244,16 @@ export default function AddItemPage() {
         .from("item-images")
         .upload(path, file, { upsert: false });
 
-      if (uploadError) throw uploadError;
+      if (uploadError) {
+        setError(`Verification photo upload failed: ${uploadError.message}`);
+        return;
+      }
 
       const { data } = supabase.storage.from("item-images").getPublicUrl(path);
       setVerifyPhotoUrl(data.publicUrl);
-    } catch (err: any) {
-      console.error(err);
-      setError(`Verification upload failed: ${err?.message || "Unknown error"}`);
+    } catch (e: any) {
+      console.error(e);
+      setError("Unexpected error while uploading verification photo.");
     }
   };
 
@@ -278,41 +262,54 @@ export default function AddItemPage() {
     if (file) void uploadVerificationPhoto(file);
   };
 
-  // ---------- submit ----------
+  const validate = () => {
+    if (!form.name.trim()) return "Item name is required.";
+    if (!form.type) return "Type is required.";
+    if (!form.category) return "Category is required.";
+    if (!form.location) return "Location is required.";
+
+    if (form.quantity === "" || Number.isNaN(Number(form.quantity)))
+      return "Quantity must be a number.";
+    const q = Number(form.quantity);
+    if (q <= 0) return "Quantity must be a positive number.";
+
+    return null;
+  };
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!userId) return;
 
-    setSaving(true);
     setError(null);
     setSuccess(false);
 
+    const v = validate();
+    if (v) {
+      setError(v);
+      return;
+    }
+
+    setSaving(true);
     try {
-      if (!form.name.trim()) throw new Error("Item name is required.");
-      if (!form.category.trim()) throw new Error("Category is required.");
-      if (!form.location.trim()) throw new Error("Location is required.");
-
-      if (form.quantity === "" || Number.isNaN(Number(form.quantity))) {
-        throw new Error("Quantity must be a number.");
-      }
-
       const quantityNum = Number(form.quantity);
-      if (quantityNum <= 0) throw new Error("Quantity must be a positive number.");
 
-      const priceNum = form.purchasePrice === "" ? null : Number(form.purchasePrice);
+      const priceNum =
+        form.purchasePrice === "" ? null : Number(form.purchasePrice);
       const purchasePrice =
-        priceNum !== null && !Number.isNaN(priceNum) && priceNum >= 0 ? priceNum : null;
+        priceNum !== null && !Number.isNaN(priceNum) && priceNum >= 0
+          ? priceNum
+          : null;
 
       const { data: item, error: insertError } = await supabase
         .from("items")
         .insert({
           user_id: userId,
           name: form.name.trim(),
-          te_number: form.teNumber.trim() || null,
+          te_number: form.teNumber.trim() || null, // optional
           description: form.description.trim() || null,
-          type: form.type || null,
-          category: form.category.trim(),
-          location: form.location.trim(),
+          type: form.type, // mandatory
+          category: form.category, // mandatory
+          location: form.location, // mandatory
           quantity: quantityNum,
           image_url: imageUrl,
           image_url_2: imageUrl2,
@@ -323,11 +320,13 @@ export default function AddItemPage() {
         .single();
 
       if (insertError || !item) {
-        throw new Error(insertError?.message || "Failed to save item.");
+        console.error(insertError);
+        setError(`Failed to save item. ${insertError?.message || ""}`);
+        return;
       }
 
       if (form.verifyOnCreate && item.id) {
-        const verRes = await supabase.from("stock_verifications").insert({
+        await supabase.from("stock_verifications").insert({
           item_id: item.id,
           verified_at: new Date().toISOString().slice(0, 10),
           verified_qty: quantityNum,
@@ -335,7 +334,6 @@ export default function AddItemPage() {
           verified_by: userId,
           photo_url: verifyPhotoUrl,
         });
-        if (verRes.error) console.error("Verification insert error:", verRes.error);
       }
 
       setSuccess(true);
@@ -353,20 +351,19 @@ export default function AddItemPage() {
       setImageUrl2(null);
       setVerifyPhotoUrl(null);
 
-      setTimeout(() => router.push("/"), 900);
-    } catch (err: any) {
-      console.error("Submit error:", err);
-      setError(err?.message || "Unexpected error.");
+      setTimeout(() => router.push("/"), 700);
+    } catch (e: any) {
+      console.error(e);
+      setError(e?.message || "Unexpected error. Please try again.");
     } finally {
       setSaving(false);
     }
   };
 
-  // ---------- render ----------
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
-        Loading...
+        Loading…
       </div>
     );
   }
@@ -374,8 +371,11 @@ export default function AddItemPage() {
   return (
     <div className="min-h-screen bg-slate-50">
       <header className="bg-white border-b border-slate-200">
-        <div className="max-w-3xl mx-auto px-4 h-16 flex items-center justify-between">
-          <Link href="/" className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900">
+        <div className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <Link
+            href="/"
+            className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900"
+          >
             <ArrowLeft className="w-4 h-4" />
             Back to dashboard
           </Link>
@@ -392,25 +392,30 @@ export default function AddItemPage() {
       </header>
 
       <main className="max-w-3xl mx-auto px-4 py-8">
-        <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-sm border p-6 space-y-8">
+        <form
+          onSubmit={handleSubmit}
+          className="bg-white rounded-2xl shadow-sm border p-6 space-y-8"
+        >
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">Add Inventory Item</h1>
+            <h1 className="text-2xl font-bold text-slate-900">
+              Add Inventory Item
+            </h1>
             <p className="text-sm text-slate-500 mt-1">
-              Category and Location are required. TE Number is optional.
+              Type, Category, and Location are required.
             </p>
           </div>
 
           {error && (
-            <div className="flex items-start gap-2 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
-              <AlertCircle className="w-4 h-4 mt-0.5" />
-              <span>{error}</span>
+            <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
+              <AlertCircle className="w-4 h-4" />
+              {error}
             </div>
           )}
 
           {success && (
             <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
               <CheckCircle2 className="w-5 h-5" />
-              Item added successfully! Redirecting...
+              Item added successfully! Redirecting…
             </div>
           )}
 
@@ -419,6 +424,7 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Basic Information
             </h2>
+
             <div className="grid gap-5 sm:grid-cols-2">
               <div className="sm:col-span-2">
                 <label className="block text-sm font-medium text-slate-700 mb-1">
@@ -429,18 +435,20 @@ export default function AddItemPage() {
                   required
                   value={form.name}
                   onChange={(e) => updateForm("name", e.target.value)}
-                  className="w-full px-4 py-2.5 border rounded-lg"
+                  placeholder="e.g. Hilti TE 70 Hammer Drill"
+                  className="w-full px-4 py-2.5 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 />
               </div>
 
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
-                  TE Number <span className="text-slate-400">(optional)</span>
+                  TE Number (optional)
                 </label>
                 <input
                   type="text"
                   value={form.teNumber}
                   onChange={(e) => updateForm("teNumber", e.target.value)}
+                  placeholder="e.g. TE-045"
                   className="w-full px-4 py-2.5 border rounded-lg"
                 />
               </div>
@@ -455,7 +463,10 @@ export default function AddItemPage() {
                   required
                   value={form.quantity}
                   onChange={(e) =>
-                    updateForm("quantity", e.target.value === "" ? "" : Number(e.target.value))
+                    updateForm(
+                      "quantity",
+                      e.target.value === "" ? "" : Number(e.target.value)
+                    )
                   }
                   className="w-full px-4 py-2.5 border rounded-lg"
                 />
@@ -469,6 +480,7 @@ export default function AddItemPage() {
                   rows={3}
                   value={form.description}
                   onChange={(e) => updateForm("description", e.target.value)}
+                  placeholder="Condition, specs, accessories…"
                   className="w-full px-4 py-2.5 border rounded-lg"
                 />
               </div>
@@ -480,24 +492,39 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Classification
             </h2>
+
             <div className="grid gap-5 sm:grid-cols-3">
+              {/* Type (MANDATORY) */}
               <div>
-                <label className="text-sm font-medium text-slate-700 mb-1 block">Type</label>
+                <div className="flex justify-between items-center mb-1">
+                  <label className="text-sm font-medium text-slate-700">
+                    Type <span className="text-red-500">*</span>
+                  </label>
+                  <Link
+                    href="/settings/types"
+                    className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                  >
+                    <Settings2 className="w-3 h-3" /> Manage
+                  </Link>
+                </div>
+
                 <select
                   value={form.type}
                   onChange={(e) => void handleTypeChange(e.target.value)}
                   className="w-full px-4 py-2.5 border rounded-lg"
+                  required
                 >
-                  <option value="">Select or add...</option>
+                  <option value="">Select or add…</option>
                   {itemTypes.map((t) => (
                     <option key={t.id} value={t.name}>
                       {t.name}
                     </option>
                   ))}
-                  <option value={ADD_TYPE}>+ Add new type...</option>
+                  <option value={ADD_TYPE}>+ Add new type…</option>
                 </select>
               </div>
 
+              {/* Category (MANDATORY) */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -510,22 +537,24 @@ export default function AddItemPage() {
                     <Settings2 className="w-3 h-3" /> Manage
                   </Link>
                 </div>
+
                 <select
                   value={form.category}
                   onChange={(e) => void handleCategoryChange(e.target.value)}
                   className="w-full px-4 py-2.5 border rounded-lg"
                   required
                 >
-                  <option value="">Select or add...</option>
+                  <option value="">Select or add…</option>
                   {categories.map((c) => (
                     <option key={c.id} value={c.name}>
                       {c.name}
                     </option>
                   ))}
-                  <option value={ADD_CATEGORY}>+ Add new category...</option>
+                  <option value={ADD_CATEGORY}>+ Add new category…</option>
                 </select>
               </div>
 
+              {/* Location (MANDATORY) */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -538,19 +567,20 @@ export default function AddItemPage() {
                     <Settings2 className="w-3 h-3" /> Manage
                   </Link>
                 </div>
+
                 <select
                   value={form.location}
                   onChange={(e) => void handleLocationChange(e.target.value)}
                   className="w-full px-4 py-2.5 border rounded-lg"
                   required
                 >
-                  <option value="">Select or add...</option>
+                  <option value="">Select or add…</option>
                   {locations.map((l) => (
                     <option key={l.id} value={l.name}>
                       {l.name}
                     </option>
                   ))}
-                  <option value={ADD_LOCATION}>+ Add new location...</option>
+                  <option value={ADD_LOCATION}>+ Add new location…</option>
                 </select>
               </div>
             </div>
@@ -561,6 +591,7 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Purchase Details
             </h2>
+
             <div className="grid gap-5 sm:grid-cols-2">
               <div>
                 <label className="block text-sm font-medium text-slate-700 mb-1">
@@ -576,8 +607,12 @@ export default function AddItemPage() {
                     min="0"
                     value={form.purchasePrice}
                     onChange={(e) =>
-                      updateForm("purchasePrice", e.target.value === "" ? "" : Number(e.target.value))
+                      updateForm(
+                        "purchasePrice",
+                        e.target.value === "" ? "" : Number(e.target.value)
+                      )
                     }
+                    placeholder="250.00"
                     className="w-full pl-10 pr-4 py-2.5 border rounded-lg"
                   />
                 </div>
@@ -607,6 +642,7 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Photos
             </h2>
+
             <div className="grid gap-6 sm:grid-cols-2">
               {[
                 { url: imageUrl, setUrl: setImageUrl, label: "Primary Photo", type: "primary" as const },
@@ -653,6 +689,7 @@ export default function AddItemPage() {
             <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-700">
               Initial Stock Verification
             </h2>
+
             <div className="bg-slate-50 border rounded-xl p-4 space-y-3">
               <label className="flex items-start gap-3 text-sm">
                 <input
@@ -676,6 +713,7 @@ export default function AddItemPage() {
                       type="text"
                       value={form.verifyNotes}
                       onChange={(e) => updateForm("verifyNotes", e.target.value)}
+                      placeholder="e.g. Physically counted in warehouse"
                       className="w-full px-4 py-2 border rounded-lg"
                     />
                   </div>
@@ -687,7 +725,11 @@ export default function AddItemPage() {
                     <label className="block border-2 border-dashed border-slate-300 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
                       {verifyPhotoUrl ? (
                         <div className="relative group">
-                          <img src={verifyPhotoUrl} alt="Verification" className="w-full h-40 object-cover rounded-lg" />
+                          <img
+                            src={verifyPhotoUrl}
+                            alt="Verification"
+                            className="w-full h-40 object-cover rounded-lg"
+                          />
                           <button
                             type="button"
                             onClick={() => setVerifyPhotoUrl(null)}
@@ -702,7 +744,12 @@ export default function AddItemPage() {
                           <p className="text-xs">Click to upload verification photo</p>
                         </div>
                       )}
-                      <input type="file" accept="image/*" className="hidden" onChange={handleVerifyPhotoChange} />
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={handleVerifyPhotoChange}
+                      />
                     </label>
                   </div>
                 </>
@@ -710,18 +757,18 @@ export default function AddItemPage() {
             </div>
           </section>
 
+          {/* Actions */}
           <div className="flex justify-between items-center pt-6 border-t">
             <Link href="/" className="text-sm text-slate-600 hover:text-slate-900">
               Cancel
             </Link>
-
             <button
               type="submit"
-              disabled={saving || !isFormValid}
+              disabled={saving}
               className="px-6 py-2.5 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
             >
-              {saving ? <Loader2 className="w-5 h-5 animate-spin" /> : <CheckCircle2 className="w-5 h-5" />}
-              {saving ? "Saving..." : "Save Item"}
+              <CheckCircle2 className="w-5 h-5" />
+              {saving ? "Saving…" : "Save Item"}
             </button>
           </div>
         </form>
