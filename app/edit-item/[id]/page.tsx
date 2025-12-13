@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, ChangeEvent } from "react";
+import { useEffect, useState, ChangeEvent, FormEvent } from "react";
 import { useRouter, useParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 import Link from "next/link";
@@ -13,28 +13,12 @@ import {
   Upload,
   Image as ImageIcon,
   X,
+  Settings2,
 } from "lucide-react";
 
-type Item = {
-  id: string;
-  name: string;
-  description: string | null;
-
-  // these are your UI “canonical” fields (what your inputs bind to)
-  category: string | null;
-  location: string | null;
-  te_number: string | null;
-
-  quantity: number;
-
-  image_url: string | null;
-  image_url_2: string | null;
-
-  purchase_price?: number | null;
-  purchase_date?: string | null;
-
-  user_id: string | null;
-};
+const ADD_CATEGORY = "__ADD_CATEGORY__";
+const ADD_LOCATION = "__ADD_LOCATION__";
+const ADD_TYPE = "__ADD_TYPE__";
 
 type Profile = {
   id: string;
@@ -42,50 +26,122 @@ type Profile = {
   display_name: string | null;
 };
 
-/**
- * The root cause of your problem is almost always one of these:
- * - DB columns are camelCase (teNumber) but UI expects snake_case (te_number)
- * - DB columns are named differently (unit_price vs purchase_price)
- * - DB uses foreign keys (category_id / location_id) but UI uses text fields
- *
- * So we:
- * 1) detect which keys exist on the row returned by Supabase
- * 2) normalize into our UI-friendly Item shape
- * 3) on save, update using the detected keys (so it persists correctly)
- */
-type ItemKeyMap = {
-  categoryKey: string;
-  locationKey: string;
-  teKey: string;
-  priceKey: string;
-  dateKey: string;
-  image1Key: string;
-  image2Key: string;
-};
+type Category = { id: string; name: string };
+type Location = { id: string; name: string };
+type ItemType = { id: string; name: string };
 
-function pickExistingKey(row: Record<string, any>, candidates: string[], fallback: string) {
-  for (const k of candidates) {
-    if (Object.prototype.hasOwnProperty.call(row, k)) return k;
-  }
-  return fallback;
-}
+type ItemRow = {
+  id: string;
+  name: string;
+  description: string | null;
+  category: string | null; // stored as TEXT name
+  location: string | null; // stored as TEXT name
+  type: string | null; // stored as TEXT name
+  quantity: number | null;
+  image_url: string | null;
+  image_url_2: string | null;
+  te_number: string | null;
+  purchase_price: number | string | null;
+  purchase_date: string | null; // YYYY-MM-DD
+  user_id: string | null;
+};
 
 export default function EditItemPage() {
   const router = useRouter();
   const params = useParams();
   const itemId = params?.id as string;
 
-  const [item, setItem] = useState<Item | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
 
-  const [keyMap, setKeyMap] = useState<ItemKeyMap | null>(null);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [locations, setLocations] = useState<Location[]>([]);
+  const [itemTypes, setItemTypes] = useState<ItemType[]>([]);
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
+
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
+
+  const [form, setForm] = useState({
+    name: "",
+    te_number: "", // optional
+    description: "",
+    type: "",
+    category: "", // REQUIRED
+    location: "", // REQUIRED
+    quantity: 0,
+    purchase_price: "" as "" | number,
+    purchase_date: "" as "" | string,
+    image_url: null as string | null,
+    image_url_2: null as string | null,
+  });
+
+  const setField = (key: keyof typeof form, value: any) =>
+    setForm((p) => ({ ...p, [key]: value }));
+
+  // Insert new master record (same behavior as Add page)
+  const addMasterItem = async (
+    table: "categories" | "locations" | "item_types",
+    name: string
+  ): Promise<{ id: string; name: string } | null> => {
+    if (!userId || !name.trim()) return null;
+
+    const { data, error } = await supabase
+      .from(table)
+      .insert({ name: name.trim(), user_id: userId })
+      .select("id, name")
+      .single();
+
+    if (error || !data) {
+      console.error(error);
+      setErrorMsg(`Failed to add ${table}.`);
+      return null;
+    }
+
+    const typed = data as { id: string; name: string };
+
+    if (table === "categories") setCategories((prev) => [...prev, typed]);
+    if (table === "locations") setLocations((prev) => [...prev, typed]);
+    if (table === "item_types") setItemTypes((prev) => [...prev, typed]);
+
+    return typed;
+  };
+
+  const handleCategoryChange = async (value: string) => {
+    if (value === ADD_CATEGORY) {
+      const name = prompt("Enter new category name:");
+      if (!name?.trim()) return;
+      const added = await addMasterItem("categories", name);
+      if (added) setField("category", added.name);
+      return;
+    }
+    setField("category", value);
+  };
+
+  const handleLocationChange = async (value: string) => {
+    if (value === ADD_LOCATION) {
+      const name = prompt("Enter new location name:");
+      if (!name?.trim()) return;
+      const added = await addMasterItem("locations", name);
+      if (added) setField("location", added.name);
+      return;
+    }
+    setField("location", value);
+  };
+
+  const handleTypeChange = async (value: string) => {
+    if (value === ADD_TYPE) {
+      const name = prompt("Enter new type (e.g. Tool, Equipment, Material):");
+      if (!name?.trim()) return;
+      const added = await addMasterItem("item_types", name);
+      if (added) setField("type", added.name);
+      return;
+    }
+    setField("type", value);
+  };
 
   useEffect(() => {
     const init = async () => {
@@ -96,14 +152,13 @@ export default function EditItemPage() {
       if (authError) console.error("Auth error:", authError);
 
       if (!userData?.user) {
-        router.push("/auth");
+        router.replace("/auth");
         return;
       }
-
       const uid = userData.user.id;
       setUserId(uid);
 
-      // Load profile
+      // profile
       const { data: prof, error: profError } = await supabase
         .from("profiles")
         .select("id, role, display_name")
@@ -120,101 +175,101 @@ export default function EditItemPage() {
         });
       }
 
-      // Load item
+      // load masters (shared, no user_id filter)
+      const [cats, locs, types] = await Promise.all([
+        supabase.from("categories").select("id, name").order("name"),
+        supabase.from("locations").select("id, name").order("name"),
+        supabase.from("item_types").select("id, name").order("name"),
+      ]);
+
+      if (!cats.error && cats.data) setCategories(cats.data as Category[]);
+      if (!locs.error && locs.data) setLocations(locs.data as Location[]);
+      if (!types.error && types.data) setItemTypes(types.data as ItemType[]);
+
+      // load item (explicit column list)
       const { data: itemData, error: itemError } = await supabase
         .from("items")
-        .select("*")
+        .select(
+          "id,name,description,category,location,type,quantity,image_url,image_url_2,te_number,purchase_price,purchase_date,user_id"
+        )
         .eq("id", itemId)
         .maybeSingle();
 
       if (itemError || !itemData) {
         console.error(itemError);
         setErrorMsg("Item could not be found.");
-        setItem(null);
         setLoading(false);
         return;
       }
 
-      const row = itemData as Record<string, any>;
+      const row = itemData as ItemRow;
 
-      // Detect DB key names from the row that came back
-      const detectedKeyMap: ItemKeyMap = {
-        categoryKey: pickExistingKey(row, ["category", "category_name", "category_id"], "category"),
-        locationKey: pickExistingKey(row, ["location", "location_name", "location_id"], "location"),
-        teKey: pickExistingKey(row, ["te_number", "teNumber", "te_no", "teNo"], "te_number"),
-        priceKey: pickExistingKey(row, ["purchase_price", "unit_price", "price", "unitPrice"], "purchase_price"),
-        dateKey: pickExistingKey(row, ["purchase_date", "purchaseDate", "date_purchased"], "purchase_date"),
-        image1Key: pickExistingKey(row, ["image_url", "imageUrl"], "image_url"),
-        image2Key: pickExistingKey(row, ["image_url_2", "imageUrl2", "image_url2"], "image_url_2"),
-      };
+      const normalizedPrice =
+        row.purchase_price === null || row.purchase_price === ""
+          ? ""
+          : Number(row.purchase_price);
 
-      setKeyMap(detectedKeyMap);
-
-      // Normalize row into UI shape
-      const normalized: Item = {
-        id: String(row.id),
+      setForm({
         name: row.name ?? "",
-        description: row.description ?? null,
-
-        // IMPORTANT: if your DB stores IDs (category_id/location_id), this will show the ID.
-        // For human-readable names, you should switch to a join later (categories/locations tables).
-        category: row[detectedKeyMap.categoryKey] ?? null,
-        location: row[detectedKeyMap.locationKey] ?? null,
-        te_number: row[detectedKeyMap.teKey] ?? null,
-
+        te_number: row.te_number ?? "",
+        description: row.description ?? "",
+        type: row.type ?? "",
+        category: row.category ?? "",
+        location: row.location ?? "",
         quantity: Number(row.quantity ?? 0),
+        purchase_price: Number.isFinite(normalizedPrice as number)
+          ? (normalizedPrice as number)
+          : "",
+        purchase_date: row.purchase_date ?? "",
+        image_url: row.image_url ?? null,
+        image_url_2: row.image_url_2 ?? null,
+      });
 
-        image_url: row[detectedKeyMap.image1Key] ?? null,
-        image_url_2: row[detectedKeyMap.image2Key] ?? null,
-
-        purchase_price:
-          row[detectedKeyMap.priceKey] === "" || row[detectedKeyMap.priceKey] == null
-            ? null
-            : Number(row[detectedKeyMap.priceKey]),
-        purchase_date: row[detectedKeyMap.dateKey] ?? null,
-
-        user_id: row.user_id ?? null,
-      };
-
-      setItem(normalized);
       setLoading(false);
     };
 
     if (itemId) void init();
   }, [itemId, router]);
 
-  const handleChange = (field: keyof Item, value: any) => {
-    if (!item) return;
-    setItem({ ...item, [field]: value });
-  };
+  const isFormValid =
+    form.name.trim().length > 0 &&
+    form.category.trim().length > 0 &&
+    form.location.trim().length > 0;
 
-  const handleSave = async () => {
-    if (!item || !keyMap) return;
+  const handleSave = async (e: FormEvent) => {
+    e.preventDefault();
 
     setSaving(true);
     setErrorMsg(null);
     setInfoMsg(null);
 
-    // Build payload using detected DB keys (so it persists regardless of schema naming)
-    const payload: Record<string, any> = {
-      name: item.name,
-      description: item.description,
-      quantity: item.quantity,
-      // always include user_id only if you want to enforce ownership; otherwise omit
-      // user_id: item.user_id,
+    // REQUIRED enforcement (Category + Location). TE is optional.
+    if (!form.category || !form.category.trim()) {
+      setErrorMsg("Category is required before saving.");
+      setSaving(false);
+      return;
+    }
+    if (!form.location || !form.location.trim()) {
+      setErrorMsg("Location is required before saving.");
+      setSaving(false);
+      return;
+    }
+
+    const payload = {
+      name: form.name.trim(),
+      te_number: form.te_number.trim() || null, // optional
+      description: form.description.trim() || null,
+      type: form.type.trim() || null,
+      category: form.category.trim(), // REQUIRED
+      location: form.location.trim(), // REQUIRED
+      quantity: Number(form.quantity || 0),
+      image_url: form.image_url,
+      image_url_2: form.image_url_2,
+      purchase_price: form.purchase_price === "" ? null : Number(form.purchase_price),
+      purchase_date: form.purchase_date === "" ? null : form.purchase_date,
     };
 
-    payload[keyMap.categoryKey] = item.category;
-    payload[keyMap.locationKey] = item.location;
-    payload[keyMap.teKey] = item.te_number;
-
-    payload[keyMap.image1Key] = item.image_url;
-    payload[keyMap.image2Key] = item.image_url_2;
-
-    payload[keyMap.priceKey] = item.purchase_price ?? null;
-    payload[keyMap.dateKey] = item.purchase_date ?? null;
-
-    const { error } = await supabase.from("items").update(payload).eq("id", item.id);
+    const { error } = await supabase.from("items").update(payload).eq("id", itemId);
 
     if (error) {
       console.error(error);
@@ -227,10 +282,10 @@ export default function EditItemPage() {
   };
 
   const handleDelete = async () => {
-    if (!item || !profile) return;
+    if (profile?.role !== "admin") return;
 
     const confirmed = window.confirm(
-      `Are you sure you want to permanently delete "${item.name}" from Stokstak? This cannot be undone.`
+      `Are you sure you want to permanently delete "${form.name}"? This cannot be undone.`
     );
     if (!confirmed) return;
 
@@ -238,7 +293,7 @@ export default function EditItemPage() {
     setErrorMsg(null);
     setInfoMsg(null);
 
-    const { error } = await supabase.from("items").delete().eq("id", item.id);
+    const { error } = await supabase.from("items").delete().eq("id", itemId);
 
     if (error) {
       console.error(error);
@@ -250,13 +305,12 @@ export default function EditItemPage() {
     router.push("/");
   };
 
-  // Upload a new image for primary/secondary and update state
   const handleImageFileChange = async (
     e: ChangeEvent<HTMLInputElement>,
     which: "primary" | "secondary"
   ) => {
     const file = e.target.files?.[0];
-    if (!file || !userId || !item) return;
+    if (!file || !userId) return;
 
     try {
       setErrorMsg(null);
@@ -278,13 +332,9 @@ export default function EditItemPage() {
       const { data } = supabase.storage.from("item-images").getPublicUrl(path);
       const url = data.publicUrl;
 
-      if (which === "primary") {
-        setItem({ ...item, image_url: url });
-      } else {
-        setItem({ ...item, image_url_2: url });
-      }
+      if (which === "primary") setField("image_url", url);
+      else setField("image_url_2", url);
 
-      // allow uploading same file again by resetting input
       e.target.value = "";
     } catch (err) {
       console.error(err);
@@ -293,29 +343,14 @@ export default function EditItemPage() {
   };
 
   const clearImage = (which: "primary" | "secondary") => {
-    if (!item) return;
-    if (which === "primary") setItem({ ...item, image_url: null });
-    else setItem({ ...item, image_url_2: null });
+    if (which === "primary") setField("image_url", null);
+    else setField("image_url_2", null);
   };
 
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading item...
-      </div>
-    );
-  }
-
-  if (!item) {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center text-slate-600">
-        <p className="mb-4">Item could not be found.</p>
-        <button
-          onClick={() => router.push("/")}
-          className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
-        >
-          Back to Stokstak
-        </button>
       </div>
     );
   }
@@ -333,11 +368,7 @@ export default function EditItemPage() {
             <ArrowLeft className="w-4 h-4" />
             Back to dashboard
           </Link>
-          <div className="flex items-center gap-2">
-            <p className="text-sm font-semibold text-slate-900">
-              Edit Item – {item.name}
-            </p>
-          </div>
+          <p className="text-sm font-semibold text-slate-900">Edit Item – {form.name}</p>
         </div>
       </header>
 
@@ -355,133 +386,166 @@ export default function EditItemPage() {
           </div>
         )}
 
-        <div className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-6">
-          {/* Basic fields */}
+        <form onSubmit={handleSave} className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-6">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Name
-              </label>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Name</label>
               <input
                 type="text"
-                value={item.name}
-                onChange={(e) => handleChange("name", e.target.value)}
+                value={form.name}
+                onChange={(e) => setField("name", e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
 
             <div>
               <label className="block text-xs font-medium text-slate-600 mb-1">
-                TE Number
+                TE Number <span className="text-slate-400">(optional)</span>
               </label>
               <input
                 type="text"
-                value={item.te_number || ""}
-                onChange={(e) => handleChange("te_number", e.target.value)}
+                value={form.te_number}
+                onChange={(e) => setField("te_number", e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
 
+            {/* Type (optional) */}
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Category
-              </label>
-              <input
-                type="text"
-                value={item.category || ""}
-                onChange={(e) => handleChange("category", e.target.value)}
+              <label className="block text-xs font-medium text-slate-600 mb-1">Type</label>
+              <select
+                value={form.type}
+                onChange={(e) => void handleTypeChange(e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
+              >
+                <option value="">Select or add...</option>
+                {itemTypes.map((t) => (
+                  <option key={t.id} value={t.name}>
+                    {t.name}
+                  </option>
+                ))}
+                <option value={ADD_TYPE}>+ Add new type...</option>
+              </select>
+            </div>
+
+            {/* Category (required) */}
+            <div>
+              <div className="flex justify-between items-center mb-1">
+                <label className="block text-xs font-medium text-slate-600">
+                  Category <span className="text-red-500">*</span>
+                </label>
+                <Link
+                  href="/settings/categories"
+                  className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                >
+                  <Settings2 className="w-3 h-3" /> Manage
+                </Link>
+              </div>
+              <select
+                value={form.category}
+                onChange={(e) => void handleCategoryChange(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
+                required
+              >
+                <option value="">Select or add...</option>
+                {categories.map((c) => (
+                  <option key={c.id} value={c.name}>
+                    {c.name}
+                  </option>
+                ))}
+                <option value={ADD_CATEGORY}>+ Add new category...</option>
+              </select>
+              {!form.category.trim() && (
+                <p className="mt-1 text-[11px] text-red-600">Category is required.</p>
+              )}
+            </div>
+
+            {/* Location (required) */}
+            <div className="sm:col-span-2">
+              <div className="flex justify-between items-center mb-1">
+                <label className="block text-xs font-medium text-slate-600">
+                  Location <span className="text-red-500">*</span>
+                </label>
+                <Link
+                  href="/settings/locations"
+                  className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+                >
+                  <Settings2 className="w-3 h-3" /> Manage
+                </Link>
+              </div>
+              <select
+                value={form.location}
+                onChange={(e) => void handleLocationChange(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg text-sm"
+                required
+              >
+                <option value="">Select or add...</option>
+                {locations.map((l) => (
+                  <option key={l.id} value={l.name}>
+                    {l.name}
+                  </option>
+                ))}
+                <option value={ADD_LOCATION}>+ Add new location...</option>
+              </select>
+              {!form.location.trim() && (
+                <p className="mt-1 text-[11px] text-red-600">Location is required.</p>
+              )}
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Location
-              </label>
-              <input
-                type="text"
-                value={item.location || ""}
-                onChange={(e) => handleChange("location", e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Quantity
-              </label>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Quantity</label>
               <input
                 type="number"
-                value={item.quantity}
-                onChange={(e) => handleChange("quantity", Number(e.target.value || 0))}
+                value={form.quantity}
+                onChange={(e) => setField("quantity", Number(e.target.value || 0))}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Unit Price
-              </label>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Unit Price</label>
               <input
                 type="number"
                 step="0.01"
-                value={item.purchase_price ?? ""}
+                value={form.purchase_price}
                 onChange={(e) =>
-                  handleChange(
-                    "purchase_price",
-                    e.target.value === "" ? null : Number(e.target.value)
-                  )
+                  setField("purchase_price", e.target.value === "" ? "" : Number(e.target.value))
                 }
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Purchase Date
-              </label>
+              <label className="block text-xs font-medium text-slate-600 mb-1">Purchase Date</label>
               <input
                 type="date"
-                value={item.purchase_date || ""}
-                onChange={(e) =>
-                  handleChange("purchase_date", e.target.value === "" ? null : e.target.value)
-                }
+                value={form.purchase_date}
+                onChange={(e) => setField("purchase_date", e.target.value)}
                 className="w-full px-3 py-2 border rounded-lg text-sm"
               />
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-slate-600 mb-1">
-              Description
-            </label>
+            <label className="block text-xs font-medium text-slate-600 mb-1">Description</label>
             <textarea
-              value={item.description || ""}
-              onChange={(e) => handleChange("description", e.target.value)}
+              value={form.description}
+              onChange={(e) => setField("description", e.target.value)}
               rows={3}
               className="w-full px-3 py-2 border rounded-lg text-sm"
             />
           </div>
 
-          {/* Photos section */}
+          {/* Photos */}
           <section className="space-y-3">
-            <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">
-              Photos
-            </h2>
+            <h2 className="text-xs font-semibold text-slate-700 uppercase tracking-wide">Photos</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              {/* Primary photo */}
               <div>
-                <p className="text-xs font-medium text-slate-600 mb-1">
-                  Primary Photo
-                </p>
+                <p className="text-xs font-medium text-slate-600 mb-1">Primary Photo</p>
                 <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
-                  {item.image_url ? (
+                  {form.image_url ? (
                     <div className="w-full relative group">
-                      <img
-                        src={item.image_url}
-                        alt={item.name}
-                        className="w-full h-40 object-cover rounded-lg"
-                      />
+                      <img src={form.image_url} alt={form.name} className="w-full h-40 object-cover rounded-lg" />
                       <button
                         type="button"
                         onClick={(e) => {
@@ -497,9 +561,7 @@ export default function EditItemPage() {
                   ) : (
                     <div className="flex flex-col items-center gap-2 text-slate-400">
                       <ImageIcon className="w-8 h-8" />
-                      <p className="text-xs text-center">
-                        Click to upload primary photo
-                      </p>
+                      <p className="text-xs text-center">Click to upload primary photo</p>
                     </div>
                   )}
                   <input
@@ -509,24 +571,16 @@ export default function EditItemPage() {
                     onChange={(e) => handleImageFileChange(e, "primary")}
                   />
                 </label>
-                {item.image_url && (
-                  <p className="mt-1 text-[10px] text-slate-400 break-all">
-                    {item.image_url}
-                  </p>
-                )}
               </div>
 
-              {/* Secondary photo */}
               <div>
-                <p className="text-xs font-medium text-slate-600 mb-1">
-                  Secondary Photo
-                </p>
+                <p className="text-xs font-medium text-slate-600 mb-1">Secondary Photo</p>
                 <label className="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 cursor-pointer hover:border-slate-400 transition">
-                  {item.image_url_2 ? (
+                  {form.image_url_2 ? (
                     <div className="w-full relative group">
                       <img
-                        src={item.image_url_2}
-                        alt={`${item.name} secondary`}
+                        src={form.image_url_2}
+                        alt={`${form.name} secondary`}
                         className="w-full h-40 object-cover rounded-lg"
                       />
                       <button
@@ -544,9 +598,7 @@ export default function EditItemPage() {
                   ) : (
                     <div className="flex flex-col items-center gap-2 text-slate-400">
                       <Upload className="w-8 h-8" />
-                      <p className="text-xs text-center">
-                        Click to upload secondary photo
-                      </p>
+                      <p className="text-xs text-center">Click to upload secondary photo</p>
                     </div>
                   )}
                   <input
@@ -556,26 +608,15 @@ export default function EditItemPage() {
                     onChange={(e) => handleImageFileChange(e, "secondary")}
                   />
                 </label>
-                {item.image_url_2 && (
-                  <p className="mt-1 text-[10px] text-slate-400 break-all">
-                    {item.image_url_2}
-                  </p>
-                )}
               </div>
             </div>
-            <p className="text-[10px] text-slate-400">
-              Note: Removing a photo here will clear it from the item record when you save.
-              Files remain in storage but are no longer linked to this item.
-            </p>
           </section>
 
-          {/* Actions */}
           <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t">
             <button
-              type="button"
-              onClick={handleSave}
-              disabled={saving || deleting}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+              type="submit"
+              disabled={saving || deleting || !isFormValid}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
             >
               {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
               {saving ? "Saving..." : "Save changes"}
@@ -593,7 +634,7 @@ export default function EditItemPage() {
               </button>
             )}
           </div>
-        </div>
+        </form>
       </main>
     </div>
   );
