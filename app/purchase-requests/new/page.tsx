@@ -13,11 +13,13 @@ import {
   AlertCircle,
   Save,
 } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 type Project = {
   id: string;
   name: string;
   code: string | null;
+  company_id?: string | null;
 };
 
 type Profile = {
@@ -36,11 +38,12 @@ type LineItem = {
   unit: string;
   application_location: string;
   est_unit_price: number | "";
-  item_type: ItemType; // "tool" | "material"
+  item_type: ItemType;
 };
 
 export default function NewPurchaseRequestPage() {
   const router = useRouter();
+  const { loading: companyLoading, companyId } = useCompany();
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -68,9 +71,10 @@ export default function NewPurchaseRequestPage() {
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    init();
+    if (companyLoading) return;
+    void init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [companyLoading, companyId]);
 
   const init = async () => {
     setLoading(true);
@@ -84,7 +88,12 @@ export default function NewPurchaseRequestPage() {
     }
     const userId = userData.user.id;
 
-    // Load or create profile
+    if (!companyId) {
+      setErrorMsg("No company assigned to this user.");
+      setLoading(false);
+      return;
+    }
+
     const email = userData.user.email || "";
     let { data: prof, error: profError } = await supabase
       .from("profiles")
@@ -106,9 +115,7 @@ export default function NewPurchaseRequestPage() {
 
       if (newProfError) {
         console.error("Error creating profile:", newProfError);
-        setErrorMsg(
-          `Could not create profile: ${newProfError.message}. Check Supabase "profiles" table.`
-        );
+        setErrorMsg(`Could not create profile: ${newProfError.message}.`);
         setLoading(false);
         return;
       }
@@ -123,33 +130,28 @@ export default function NewPurchaseRequestPage() {
     }
 
     if (prof.is_active === false) {
-      setErrorMsg(
-        "Your account has been disabled. Contact your admin to re-enable access."
-      );
+      setErrorMsg("Your account has been disabled. Contact your admin to re-enable access.");
       setLoading(false);
       return;
     }
 
-    const myProfile: Profile = {
+    setProfile({
       id: prof.id,
       role: prof.role || "requester",
       display_name: prof.display_name || email,
       is_active: prof.is_active ?? true,
-    };
+    });
 
-    setProfile(myProfile);
-
-    // Load projects
+    // Load projects (company scoped)
     const { data: projData, error: projError } = await supabase
       .from("projects")
-      .select("id, name, code")
+      .select("id, name, code, company_id")
+      .eq("company_id", companyId)
       .order("name", { ascending: true });
 
     if (projError) {
       console.error("Error loading projects:", projError);
-      setErrorMsg(
-        `Error loading projects: ${projError.message}. Ensure "projects" table exists and RLS allows select.`
-      );
+      setErrorMsg(`Error loading projects: ${projError.message}.`);
       setLoading(false);
       return;
     }
@@ -178,29 +180,27 @@ export default function NewPurchaseRequestPage() {
   };
 
   const updateItem = (id: string, patch: Partial<LineItem>) => {
-    setItems((prev) =>
-      prev.map((it) => (it.id === id ? { ...it, ...patch } : it))
-    );
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...patch } : it)));
   };
 
   const validateForm = (): string | null => {
-    if (!projectId) {
-      return "Please select a project.";
-    }
+    if (!projectId) return "Please select a project.";
 
     const nonEmptyItems = items.filter(
       (it) => it.description.trim() !== "" && Number(it.quantity || 0) > 0
     );
-
     if (nonEmptyItems.length === 0) {
       return "Please add at least one line item with description and quantity.";
     }
-
     return null;
   };
 
   const handleSubmit = async () => {
     if (!profile) return;
+    if (!companyId) {
+      setErrorMsg("No company assigned to this user.");
+      return;
+    }
 
     setErrorMsg(null);
     setInfoMsg(null);
@@ -214,10 +214,10 @@ export default function NewPurchaseRequestPage() {
     setSaving(true);
 
     try {
-      // 1) Create purchase request (only columns we KNOW are safe)
       const { data: req, error: reqError } = await supabase
         .from("purchase_requests")
         .insert({
+          company_id: companyId,
           project_id: projectId || null,
           requested_by: profile.id,
           status: "submitted",
@@ -229,36 +229,25 @@ export default function NewPurchaseRequestPage() {
 
       if (reqError || !req) {
         console.error("Supabase insert error (purchase_requests):", reqError);
-        setErrorMsg(
-          `Error creating purchase request: ${
-            reqError?.message || "Unknown error"
-          }`
-        );
+        setErrorMsg(`Error creating purchase request: ${reqError?.message || "Unknown error"}`);
         setSaving(false);
         return;
       }
 
       const requestId = req.id as string;
 
-      // 2) Insert line items
       const payloadItems = items
-        .filter(
-          (it) => it.description.trim() !== "" && Number(it.quantity || 0) > 0
-        )
+        .filter((it) => it.description.trim() !== "" && Number(it.quantity || 0) > 0)
         .map((it) => ({
+          company_id: companyId,
           request_id: requestId,
-          item_id: null, // link to inventory item later if needed
+          item_id: null,
           description: it.description.trim(),
           quantity: Number(it.quantity || 0),
           unit: it.unit || "ea",
-          application_location:
-            it.application_location.trim() === ""
-              ? null
-              : it.application_location.trim(),
-          est_unit_price:
-            it.est_unit_price === "" ? null : Number(it.est_unit_price),
+          application_location: it.application_location.trim() === "" ? null : it.application_location.trim(),
+          est_unit_price: it.est_unit_price === "" ? null : Number(it.est_unit_price),
           status: "pending",
-          // IMPORTANT: ensure only valid values for the check constraint
           item_type: it.item_type === "material" ? "material" : "tool",
         }));
 
@@ -268,39 +257,43 @@ export default function NewPurchaseRequestPage() {
           .insert(payloadItems);
 
         if (itemsError) {
-          console.error(
-            "Supabase insert error (purchase_request_items):",
-            itemsError
-          );
-          setErrorMsg(
-            `Request created but items failed: ${itemsError.message}. Check "purchase_request_items" columns and RLS.`
-          );
+          console.error("Supabase insert error (purchase_request_items):", itemsError);
+          setErrorMsg(`Request created but items failed: ${itemsError.message}.`);
           setSaving(false);
           return;
         }
       }
 
       setInfoMsg("Purchase request created and submitted for approval.");
-      // Short delay then go to detail page
-      setTimeout(() => {
-        router.push(`/purchase-requests/${requestId}`);
-      }, 800);
+      setTimeout(() => router.push(`/purchase-requests/${requestId}`), 800);
     } catch (err: any) {
       console.error("Unexpected error creating purchase request:", err);
-      setErrorMsg(
-        `Unexpected error creating purchase request: ${
-          err?.message || String(err)
-        }`
-      );
+      setErrorMsg(`Unexpected error creating purchase request: ${err?.message || String(err)}`);
     } finally {
       setSaving(false);
     }
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -315,7 +308,6 @@ export default function NewPurchaseRequestPage() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Header */}
       <header className="bg-white border-b border-slate-200">
         <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
           <Link
@@ -331,18 +323,13 @@ export default function NewPurchaseRequestPage() {
               <ClipboardList className="w-5 h-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-slate-900">
-                New Purchase Request
-              </p>
-              <p className="text-xs text-slate-500">
-                Role: {profile.role || "requester"}
-              </p>
+              <p className="text-sm font-semibold text-slate-900">New Purchase Request</p>
+              <p className="text-xs text-slate-500">Role: {profile.role || "requester"}</p>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Main */}
       <main className="max-w-4xl mx-auto px-4 py-6 space-y-4">
         {errorMsg && (
           <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center gap-2">
@@ -358,14 +345,10 @@ export default function NewPurchaseRequestPage() {
           </div>
         )}
 
-        {/* Request header card */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Project */}
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">
-                Project
-              </label>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Project</label>
               <select
                 value={projectId}
                 onChange={(e) => setProjectId(e.target.value)}
@@ -381,11 +364,8 @@ export default function NewPurchaseRequestPage() {
               </select>
             </div>
 
-            {/* Needed by */}
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">
-                Needed by date
-              </label>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Needed by date</label>
               <div className="relative">
                 <Calendar className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
@@ -398,11 +378,8 @@ export default function NewPurchaseRequestPage() {
             </div>
           </div>
 
-          {/* Notes */}
           <div>
-            <label className="block text-xs font-semibold text-slate-600 mb-1">
-              Overall notes (optional)
-            </label>
+            <label className="block text-xs font-semibold text-slate-600 mb-1">Overall notes (optional)</label>
             <textarea
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
@@ -413,12 +390,9 @@ export default function NewPurchaseRequestPage() {
           </div>
         </section>
 
-        {/* Line items */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
-              Line Items
-            </h2>
+            <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">Line Items</h2>
             <button
               type="button"
               onClick={handleAddItem}
@@ -429,161 +403,107 @@ export default function NewPurchaseRequestPage() {
             </button>
           </div>
 
-          {items.length === 0 ? (
-            <p className="text-xs text-slate-500">
-              No items yet. Click “Add item” to start.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              {items.map((it, idx) => (
-                <div
-                  key={it.id}
-                  className="border rounded-xl p-3 bg-slate-50 space-y-3"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-xs font-semibold text-slate-600">
-                      Item {idx + 1}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveItem(it.id)}
-                      disabled={items.length === 1}
-                      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-red-700 hover:bg-red-50 disabled:opacity-40"
+          <div className="space-y-3">
+            {items.map((it, idx) => (
+              <div key={it.id} className="border rounded-xl p-3 bg-slate-50 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-slate-600">Item {idx + 1}</p>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveItem(it.id)}
+                    disabled={items.length === 1}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-red-700 hover:bg-red-50 disabled:opacity-40"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Remove
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="md:col-span-2">
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Description</label>
+                    <input
+                      type="text"
+                      value={it.description}
+                      onChange={(e) => updateItem(it.id, { description: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm"
+                      placeholder={'e.g. 2" rigid conduit, cordless hammer drill, safety harness...'}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">Type</label>
+                    <select
+                      value={it.item_type}
+                      onChange={(e) =>
+                        updateItem(it.id, { item_type: e.target.value === "material" ? "material" : "tool" })
+                      }
+                      className="w-full px-3 py-2 border rounded-lg text-sm"
                     >
-                      <Trash2 className="w-3 h-3" />
-                      Remove
-                    </button>
+                      <option value="tool">Tools &amp; Eqpt</option>
+                      <option value="material">Site Materials</option>
+                    </select>
                   </div>
+                </div>
 
-                  {/* Description + Type */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    {/* Description */}
-                    <div className="md:col-span-2">
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Description
-                      </label>
-                      <input
-                        type="text"
-                        value={it.description}
-                        onChange={(e) =>
-                          updateItem(it.id, {
-                            description: e.target.value,
-                          })
-                        }
-                        className="w-full px-3 py-2 border rounded-lg text-sm"
-                        placeholder={
-                          'e.g. 2" rigid conduit, cordless hammer drill, safety harness...'
-                        }
-                      />
-                    </div>
-
-                    {/* Type: Tools & Eqpt vs Materials */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="grid grid-cols-2 gap-2 md:col-span-1">
                     <div>
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Type
-                      </label>
-                      <select
-                        value={it.item_type}
-                        onChange={(e) =>
-                          updateItem(it.id, {
-                            item_type:
-                              e.target.value === "material"
-                                ? "material"
-                                : "tool",
-                          })
-                        }
-                        className="w-full px-3 py-2 border rounded-lg text-sm"
-                      >
-                        <option value="tool">Tools &amp; Eqpt</option>
-                        <option value="material">Site Materials</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  {/* Quantity & unit */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <div className="grid grid-cols-2 gap-2 md:col-span-1">
-                      <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                          Qty
-                        </label>
-                        <input
-                          type="number"
-                          min={0}
-                          value={it.quantity}
-                          onChange={(e) =>
-                            updateItem(it.id, {
-                              quantity:
-                                e.target.value === ""
-                                  ? ""
-                                  : Number(e.target.value),
-                            })
-                          }
-                          className="w-full px-3 py-2 border rounded-lg text-sm"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                          Unit
-                        </label>
-                        <input
-                          type="text"
-                          value={it.unit}
-                          onChange={(e) =>
-                            updateItem(it.id, {
-                              unit: e.target.value,
-                            })
-                          }
-                          className="w-full px-3 py-2 border rounded-lg text-sm"
-                          placeholder="ea, box, roll..."
-                        />
-                      </div>
-                    </div>
-
-                    {/* Application location */}
-                    <div className="md:col-span-1">
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Application location (optional)
-                      </label>
-                      <input
-                        type="text"
-                        value={it.application_location}
-                        onChange={(e) =>
-                          updateItem(it.id, {
-                            application_location: e.target.value,
-                          })
-                        }
-                        className="w-full px-3 py-2 border rounded-lg text-sm"
-                        placeholder="e.g. MER Level 02, North Tube, Roof Area A..."
-                      />
-                    </div>
-
-                    {/* Est. unit price */}
-                    <div>
-                      <label className="block text-[11px] font-medium text-slate-600 mb-1">
-                        Est. unit price (optional)
-                      </label>
+                      <label className="block text-[11px] font-medium text-slate-600 mb-1">Qty</label>
                       <input
                         type="number"
                         min={0}
-                        value={it.est_unit_price}
+                        value={it.quantity}
                         onChange={(e) =>
-                          updateItem(it.id, {
-                            est_unit_price:
-                              e.target.value === ""
-                                ? ""
-                                : Number(e.target.value),
-                          })
+                          updateItem(it.id, { quantity: e.target.value === "" ? "" : Number(e.target.value) })
                         }
                         className="w-full px-3 py-2 border rounded-lg text-sm"
-                        placeholder="0.00"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-medium text-slate-600 mb-1">Unit</label>
+                      <input
+                        type="text"
+                        value={it.unit}
+                        onChange={(e) => updateItem(it.id, { unit: e.target.value })}
+                        className="w-full px-3 py-2 border rounded-lg text-sm"
+                        placeholder="ea, box, roll..."
                       />
                     </div>
                   </div>
+
+                  <div className="md:col-span-1">
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Application location (optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={it.application_location}
+                      onChange={(e) => updateItem(it.id, { application_location: e.target.value })}
+                      className="w-full px-3 py-2 border rounded-lg text-sm"
+                      placeholder="e.g. MER Level 02, North Tube, Roof Area A..."
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-600 mb-1">
+                      Est. unit price (optional)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      value={it.est_unit_price}
+                      onChange={(e) =>
+                        updateItem(it.id, { est_unit_price: e.target.value === "" ? "" : Number(e.target.value) })
+                      }
+                      className="w-full px-3 py-2 border rounded-lg text-sm"
+                      placeholder="0.00"
+                    />
+                  </div>
                 </div>
-              ))}
-            </div>
-          )}
+              </div>
+            ))}
+          </div>
 
           <div className="flex justify-end pt-3 border-t mt-2">
             <button

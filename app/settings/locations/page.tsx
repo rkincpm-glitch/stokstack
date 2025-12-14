@@ -5,15 +5,18 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { ArrowLeft, Plus, Save, Trash2, X, Search, AlertCircle } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 type LocationRow = {
   id: string;
   name: string;
   user_id: string | null;
+  company_id?: string | null;
 };
 
 export default function LocationsSettingsPage() {
   const router = useRouter();
+  const { loading: companyLoading, companyId } = useCompany();
 
   const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -30,9 +33,10 @@ export default function LocationsSettingsPage() {
   const [editingName, setEditingName] = useState("");
 
   useEffect(() => {
+    if (companyLoading) return;
     void init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [companyLoading, companyId]);
 
   const init = async () => {
     setLoading(true);
@@ -45,14 +49,21 @@ export default function LocationsSettingsPage() {
     }
     setUserId(userData.user.id);
 
-    await loadLocations();
+    if (!companyId) {
+      setRows([]);
+      setLoading(false);
+      return;
+    }
+
+    await loadLocations(companyId);
     setLoading(false);
   };
 
-  const loadLocations = async () => {
+  const loadLocations = async (cid: string) => {
     const { data, error } = await supabase
       .from("locations")
-      .select("id, name, user_id")
+      .select("id, name, user_id, company_id")
+      .eq("company_id", cid)
       .order("name", { ascending: true });
 
     if (error) {
@@ -83,6 +94,11 @@ export default function LocationsSettingsPage() {
 
   const saveEdit = async () => {
     if (!editingId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const name = editingName.trim();
     if (!name) {
       setError("Name cannot be blank.");
@@ -95,7 +111,8 @@ export default function LocationsSettingsPage() {
     const { error } = await supabase
       .from("locations")
       .update({ name })
-      .eq("id", editingId);
+      .eq("id", editingId)
+      .eq("company_id", companyId);
 
     if (error) {
       console.error(error);
@@ -113,6 +130,11 @@ export default function LocationsSettingsPage() {
 
   const addLocation = async () => {
     if (!userId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const name = newName.trim();
     if (!name) return;
 
@@ -121,8 +143,8 @@ export default function LocationsSettingsPage() {
 
     const { data, error } = await supabase
       .from("locations")
-      .insert({ name, user_id: userId })
-      .select("id, name, user_id")
+      .insert({ name, user_id: userId, company_id: companyId })
+      .select("id, name, user_id, company_id")
       .single();
 
     if (error || !data) {
@@ -142,13 +164,22 @@ export default function LocationsSettingsPage() {
   };
 
   const deleteLocation = async (row: LocationRow) => {
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const ok = confirm(`Delete location "${row.name}"? This cannot be undone.`);
     if (!ok) return;
 
     setSaving(true);
     setError(null);
 
-    const { error } = await supabase.from("locations").delete().eq("id", row.id);
+    const { error } = await supabase
+      .from("locations")
+      .delete()
+      .eq("id", row.id)
+      .eq("company_id", companyId);
 
     if (error) {
       console.error(error);
@@ -161,10 +192,26 @@ export default function LocationsSettingsPage() {
     setSaving(false);
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading locations...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }

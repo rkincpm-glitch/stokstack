@@ -15,6 +15,7 @@ import {
   X,
   Settings2,
 } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 const ADD_CATEGORY = "__ADD_CATEGORY__";
 const ADD_LOCATION = "__ADD_LOCATION__";
@@ -32,6 +33,7 @@ type ItemType = { id: string; name: string };
 
 type ItemRow = {
   id: string;
+  company_id?: string | null;
   name: string;
   description: string | null;
   category: string | null;
@@ -52,19 +54,29 @@ function coerceParam(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
 
+async function safeInsertMaster(
+  table: "categories" | "locations" | "item_types",
+  payload: any
+) {
+  const first = await supabase.from(table).insert(payload).select("id,name").single();
+  if (!first.error) return first;
+
+  const msg = first.error?.message?.toLowerCase() || "";
+  if (msg.includes('column "user_id"') || msg.includes("user_id")) {
+    const { user_id, ...rest } = payload;
+    return await supabase.from(table).insert(rest).select("id,name").single();
+  }
+  return first;
+}
+
 export default function EditItemPage() {
   const router = useRouter();
   const params = useParams();
+  const { loading: companyLoading, companyId } = useCompany();
 
-  // ✅ Robustly read the dynamic route param, regardless of folder naming
   const itemId = useMemo(() => {
     const p: any = params || {};
-    return (
-      coerceParam(p.id) ||
-      coerceParam(p.itemId) ||
-      coerceParam(p.item_id) ||
-      null
-    );
+    return coerceParam(p.id) || coerceParam(p.itemId) || coerceParam(p.item_id) || null;
   }, [params]);
 
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -83,11 +95,11 @@ export default function EditItemPage() {
 
   const [form, setForm] = useState({
     name: "",
-    te_number: "", // optional
+    te_number: "",
     description: "",
     type: "",
-    category: "", // REQUIRED
-    location: "", // REQUIRED
+    category: "",
+    location: "",
     quantity: 0,
     purchase_price: "" as "" | number,
     purchase_date: "" as "" | string,
@@ -102,13 +114,10 @@ export default function EditItemPage() {
     table: "categories" | "locations" | "item_types",
     name: string
   ): Promise<{ id: string; name: string } | null> => {
-    if (!userId || !name.trim()) return null;
+    if (!userId || !companyId || !name.trim()) return null;
 
-    const { data, error } = await supabase
-      .from(table)
-      .insert({ name: name.trim(), user_id: userId })
-      .select("id, name")
-      .single();
+    const payload = { name: name.trim(), user_id: userId, company_id: companyId };
+    const { data, error } = await safeInsertMaster(table, payload);
 
     if (error || !data) {
       console.error(error);
@@ -117,11 +126,9 @@ export default function EditItemPage() {
     }
 
     const typed = data as { id: string; name: string };
-
     if (table === "categories") setCategories((prev) => [...prev, typed]);
     if (table === "locations") setLocations((prev) => [...prev, typed]);
     if (table === "item_types") setItemTypes((prev) => [...prev, typed]);
-
     return typed;
   };
 
@@ -160,11 +167,12 @@ export default function EditItemPage() {
 
   useEffect(() => {
     const init = async () => {
+      if (companyLoading) return;
+
       setLoading(true);
       setErrorMsg(null);
       setInfoMsg(null);
 
-      // ✅ Stop infinite loading if route param is missing
       if (!itemId) {
         setErrorMsg(
           "Item ID is missing from the URL. Check your route folder name and param (e.g. [id] vs [itemId])."
@@ -173,9 +181,7 @@ export default function EditItemPage() {
         return;
       }
 
-      const { data: userData, error: authError } = await supabase.auth.getUser();
-      if (authError) console.error("Auth error:", authError);
-
+      const { data: userData } = await supabase.auth.getUser();
       if (!userData?.user) {
         router.replace("/auth");
         return;
@@ -185,12 +191,11 @@ export default function EditItemPage() {
       setUserId(uid);
 
       // profile
-      const { data: prof, error: profError } = await supabase
+      const { data: prof } = await supabase
         .from("profiles")
         .select("id, role, display_name")
         .eq("id", uid)
         .maybeSingle();
-      if (profError) console.error("Profile load error:", profError);
 
       if (prof) {
         setProfile({
@@ -200,23 +205,29 @@ export default function EditItemPage() {
         });
       }
 
-      // masters
+      if (!companyId) {
+        setLoading(false);
+        return;
+      }
+
+      // masters (company scoped)
       const [cats, locs, types] = await Promise.all([
-        supabase.from("categories").select("id, name").order("name"),
-        supabase.from("locations").select("id, name").order("name"),
-        supabase.from("item_types").select("id, name").order("name"),
+        supabase.from("categories").select("id, name").eq("company_id", companyId).order("name"),
+        supabase.from("locations").select("id, name").eq("company_id", companyId).order("name"),
+        supabase.from("item_types").select("id, name").eq("company_id", companyId).order("name"),
       ]);
 
       if (!cats.error && cats.data) setCategories(cats.data as Category[]);
       if (!locs.error && locs.data) setLocations(locs.data as Location[]);
       if (!types.error && types.data) setItemTypes(types.data as ItemType[]);
 
-      // item
+      // item (company scoped)
       const { data: itemData, error: itemError } = await supabase
         .from("items")
         .select(
-          "id,name,description,category,location,type,quantity,image_url,image_url_2,te_number,purchase_price,purchase_date,user_id"
+          "id,company_id,name,description,category,location,type,quantity,image_url,image_url_2,te_number,purchase_price,purchase_date,user_id"
         )
+        .eq("company_id", companyId)
         .eq("id", itemId)
         .maybeSingle();
 
@@ -229,9 +240,7 @@ export default function EditItemPage() {
 
       const row = itemData as ItemRow;
       const normalizedPrice =
-        row.purchase_price === null || row.purchase_price === ""
-          ? ""
-          : Number(row.purchase_price);
+        row.purchase_price === null || row.purchase_price === "" ? "" : Number(row.purchase_price);
 
       setForm({
         name: row.name ?? "",
@@ -241,9 +250,7 @@ export default function EditItemPage() {
         category: row.category ?? "",
         location: row.location ?? "",
         quantity: Number(row.quantity ?? 0),
-        purchase_price: Number.isFinite(normalizedPrice as number)
-          ? (normalizedPrice as number)
-          : "",
+        purchase_price: Number.isFinite(normalizedPrice as number) ? (normalizedPrice as number) : "",
         purchase_date: row.purchase_date ?? "",
         image_url: row.image_url ?? null,
         image_url_2: row.image_url_2 ?? null,
@@ -253,27 +260,23 @@ export default function EditItemPage() {
     };
 
     void init();
-  }, [itemId, router]);
+  }, [itemId, router, companyLoading, companyId]);
 
   const isFormValid =
-    form.name.trim().length > 0 &&
-    form.category.trim().length > 0 &&
-    form.location.trim().length > 0;
+    form.name.trim().length > 0 && form.category.trim().length > 0 && form.location.trim().length > 0;
 
   const handleSave = async (e: FormEvent) => {
     e.preventDefault();
+    if (!itemId) return;
+    if (!companyId) {
+      setErrorMsg("No company assigned to this user.");
+      return;
+    }
 
     setSaving(true);
     setErrorMsg(null);
     setInfoMsg(null);
 
-    if (!itemId) {
-      setErrorMsg("Missing item id.");
-      setSaving(false);
-      return;
-    }
-
-    // Enforce Category + Location (TE optional)
     if (!form.category.trim()) {
       setErrorMsg("Category is required before saving.");
       setSaving(false);
@@ -299,7 +302,11 @@ export default function EditItemPage() {
       purchase_date: form.purchase_date === "" ? null : form.purchase_date,
     };
 
-    const { error } = await supabase.from("items").update(payload).eq("id", itemId);
+    const { error } = await supabase
+      .from("items")
+      .update(payload)
+      .eq("company_id", companyId)
+      .eq("id", itemId);
 
     if (error) {
       console.error(error);
@@ -314,6 +321,10 @@ export default function EditItemPage() {
   const handleDelete = async () => {
     if (profile?.role !== "admin") return;
     if (!itemId) return;
+    if (!companyId) {
+      setErrorMsg("No company assigned to this user.");
+      return;
+    }
 
     const confirmed = window.confirm(
       `Are you sure you want to permanently delete "${form.name}"? This cannot be undone.`
@@ -324,7 +335,11 @@ export default function EditItemPage() {
     setErrorMsg(null);
     setInfoMsg(null);
 
-    const { error } = await supabase.from("items").delete().eq("id", itemId);
+    const { error } = await supabase
+      .from("items")
+      .delete()
+      .eq("company_id", companyId)
+      .eq("id", itemId);
 
     if (error) {
       console.error(error);
@@ -376,10 +391,26 @@ export default function EditItemPage() {
     else setField("image_url_2", null);
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading item...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -412,10 +443,7 @@ export default function EditItemPage() {
     <div className="min-h-screen bg-slate-50">
       <header className="bg-white border-b border-slate-200">
         <div className="max-w-3xl mx-auto px-4 h-16 flex items-center justify-between">
-          <Link
-            href="/"
-            className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900"
-          >
+          <Link href="/" className="flex items-center gap-2 text-sm text-slate-600 hover:text-slate-900">
             <ArrowLeft className="w-4 h-4" />
             Back to dashboard
           </Link>

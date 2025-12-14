@@ -13,11 +13,13 @@ import {
   Clock3,
   History,
 } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 type Project = {
   id: string;
   name: string;
   code: string | null;
+  company_id?: string | null;
 };
 
 type PurchaseRequest = {
@@ -32,8 +34,8 @@ type PurchaseRequest = {
   president_approved_by: string | null;
   purchased_by: string | null;
   received_by: string | null;
-  // optional human-readable number like PUR-00101 if you added it
   pur_number?: string | null;
+  company_id?: string | null;
 };
 
 type RequestWithProject = PurchaseRequest & {
@@ -67,9 +69,11 @@ const STATUS_COLOR: Record<string, string> = {
 
 export default function PurchaseRequestsPage() {
   const router = useRouter();
-  const [loading, setLoading] = useState(true);
+  const { loading: companyLoading, companyId } = useCompany();
 
+  const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<Profile | null>(null);
+
   const [myRequests, setMyRequests] = useState<RequestWithProject[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<RequestWithProject[]>([]);
   const [historyRequests, setHistoryRequests] = useState<RequestWithProject[]>([]);
@@ -77,9 +81,10 @@ export default function PurchaseRequestsPage() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
-    loadData();
+    if (companyLoading) return;
+    void loadData();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [companyLoading, companyId]);
 
   const loadData = async () => {
     setLoading(true);
@@ -92,6 +97,15 @@ export default function PurchaseRequestsPage() {
     }
     const userId = userData.user.id;
     const email = userData.user.email || "";
+
+    if (!companyId) {
+      setProfile(null);
+      setMyRequests([]);
+      setPendingApprovals([]);
+      setHistoryRequests([]);
+      setLoading(false);
+      return;
+    }
 
     // 1) Profile / role
     let role = "requester";
@@ -107,7 +121,6 @@ export default function PurchaseRequestsPage() {
       role = profData.role || "requester";
       displayName = profData.display_name || null;
     } else if (!profData) {
-      // auto-create basic profile if missing
       await supabase.from("profiles").insert({
         id: userId,
         role: "requester",
@@ -118,10 +131,11 @@ export default function PurchaseRequestsPage() {
     const myProfile: Profile = { id: userId, role, display_name: displayName };
     setProfile(myProfile);
 
-    // 2) Load projects (simple org-wide list)
+    // 2) Load projects (company scoped)
     const { data: projData, error: projError } = await supabase
       .from("projects")
-      .select("id, name, code");
+      .select("id, name, code, company_id")
+      .eq("company_id", companyId);
 
     if (projError) {
       console.error(projError);
@@ -131,16 +145,25 @@ export default function PurchaseRequestsPage() {
     }
 
     const projectMap = new Map<string, Project>();
-    (projData || []).forEach((p) => {
-      projectMap.set(p.id, p as Project);
-    });
+    (projData || []).forEach((p) => projectMap.set(p.id, p as Project));
 
-    // 3) My requests (I am requester)
+    // Helper to map requests -> include project name/code
+    const attachProject = (r: any): RequestWithProject => {
+      const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
+      return {
+        ...(r as PurchaseRequest),
+        project_name: proj?.name || null,
+        project_code: proj?.code || null,
+      };
+    };
+
+    // 3) My requests (company scoped)
     const { data: myReqData, error: myReqError } = await supabase
       .from("purchase_requests")
       .select(
-        "id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
+        "id, company_id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
       )
+      .eq("company_id", companyId)
       .eq("requested_by", userId)
       .order("created_at", { ascending: false });
 
@@ -151,40 +174,26 @@ export default function PurchaseRequestsPage() {
       return;
     }
 
-    const myWithProj: RequestWithProject[] = (myReqData || []).map((r) => {
-      const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
-      return {
-        ...(r as PurchaseRequest),
-        project_name: proj?.name || null,
-        project_code: proj?.code || null,
-      };
-    });
+    setMyRequests((myReqData || []).map(attachProject));
 
-    setMyRequests(myWithProj);
-
-    // 4) Pending approvals for my role (Needs my attention)
+    // 4) Pending approvals for my role (company scoped)
     let statusFilter: string[] = [];
 
-    if (role === "pm") {
-      statusFilter = ["submitted"];
-    } else if (role === "president") {
-      statusFilter = ["pm_approved"];
-    } else if (role === "purchaser") {
-      statusFilter = ["president_approved"];
-    } else if (role === "admin") {
-      statusFilter = ["submitted", "pm_approved", "president_approved"];
-    } else {
-      statusFilter = [];
-    }
+    if (role === "pm") statusFilter = ["submitted"];
+    else if (role === "president") statusFilter = ["pm_approved"];
+    else if (role === "purchaser") statusFilter = ["president_approved"];
+    else if (role === "admin") statusFilter = ["submitted", "pm_approved", "president_approved"];
+    else statusFilter = [];
 
     if (statusFilter.length > 0) {
       const { data: pendingData, error: pendingError } = await supabase
         .from("purchase_requests")
         .select(
-          "id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
+          "id, company_id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
         )
+        .eq("company_id", companyId)
         .in("status", statusFilter)
-        .order("created_at", { ascending: true }); // oldest first so you clear backlog
+        .order("created_at", { ascending: true });
 
       if (pendingError) {
         console.error(pendingError);
@@ -193,26 +202,18 @@ export default function PurchaseRequestsPage() {
         return;
       }
 
-      const pendWithProj: RequestWithProject[] = (pendingData || []).map((r) => {
-        const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
-        return {
-          ...(r as PurchaseRequest),
-          project_name: proj?.name || null,
-          project_code: proj?.code || null,
-        };
-      });
-
-      setPendingApprovals(pendWithProj);
+      setPendingApprovals((pendingData || []).map(attachProject));
     } else {
       setPendingApprovals([]);
     }
 
-    // 5) History: all requests where this user had any role in the workflow
+    // 5) History (company scoped)
     const { data: historyData, error: historyError } = await supabase
       .from("purchase_requests")
       .select(
-        "id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
+        "id, company_id, project_id, requested_by, status, needed_by, created_at, notes, pm_approved_by, president_approved_by, purchased_by, received_by, pur_number"
       )
+      .eq("company_id", companyId)
       .or(
         `requested_by.eq.${userId},pm_approved_by.eq.${userId},president_approved_by.eq.${userId},purchased_by.eq.${userId},received_by.eq.${userId}`
       )
@@ -220,18 +221,9 @@ export default function PurchaseRequestsPage() {
 
     if (historyError) {
       console.error(historyError);
-      // non-fatal: just leave history empty
       setHistoryRequests([]);
     } else {
-      const histWithProj: RequestWithProject[] = (historyData || []).map((r) => {
-        const proj = r.project_id ? projectMap.get(r.project_id) : undefined;
-        return {
-          ...(r as PurchaseRequest),
-          project_name: proj?.name || null,
-          project_code: proj?.code || null,
-        };
-      });
-      setHistoryRequests(histWithProj);
+      setHistoryRequests((historyData || []).map(attachProject));
     }
 
     setLoading(false);
@@ -262,26 +254,20 @@ export default function PurchaseRequestsPage() {
             </thead>
             <tbody>
               {list.map((r) => {
-                const statusClass =
-                  STATUS_COLOR[r.status] || "bg-slate-100 text-slate-700";
+                const statusClass = STATUS_COLOR[r.status] || "bg-slate-100 text-slate-700";
                 const label = STATUS_LABEL[r.status] || r.status;
                 const shortId = r.id.slice(0, 8);
                 const numberLabel = r.pur_number || `PUR-${shortId}`;
 
                 return (
-                  <tr
-                    key={r.id}
-                    className="border-b last:border-0 hover:bg-slate-50"
-                  >
+                  <tr key={r.id} className="border-b last:border-0 hover:bg-slate-50">
                     <td className="px-4 py-3">
                       <div className="flex flex-col">
                         <span className="font-medium text-slate-900">
                           {r.project_name || "No project"}
                         </span>
                         {r.project_code && (
-                          <span className="text-xs text-slate-500">
-                            {r.project_code}
-                          </span>
+                          <span className="text-xs text-slate-500">{r.project_code}</span>
                         )}
                       </div>
                     </td>
@@ -290,15 +276,11 @@ export default function PurchaseRequestsPage() {
                         <span className="text-sm font-medium text-slate-800">
                           {numberLabel}
                         </span>
-                        <span className="text-[11px] text-slate-400">
-                          ID: {shortId}
-                        </span>
+                        <span className="text-[11px] text-slate-400">ID: {shortId}</span>
                       </div>
                     </td>
                     <td className="px-4 py-3">
-                      <span
-                        className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${statusClass}`}
-                      >
+                      <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-medium ${statusClass}`}>
                         {label}
                       </span>
                     </td>
@@ -333,10 +315,26 @@ export default function PurchaseRequestsPage() {
     );
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-500">
         Loading purchase requests...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -351,7 +349,6 @@ export default function PurchaseRequestsPage() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Header */}
       <header className="bg-white border-b border-slate-200">
         <div className="max-w-5xl mx-auto px-4 h-16 flex items-center justify-between">
           <Link
@@ -367,23 +364,16 @@ export default function PurchaseRequestsPage() {
               <ClipboardList className="w-5 h-5 text-white" />
             </div>
             <div>
-              <p className="text-sm font-semibold text-slate-900">
-                Purchase Requests
-              </p>
-              <p className="text-xs text-slate-500">
-                Role: {profile.role}
-              </p>
+              <p className="text-sm font-semibold text-slate-900">Purchase Requests</p>
+              <p className="text-xs text-slate-500">Role: {profile.role}</p>
             </div>
           </div>
         </div>
       </header>
 
-      {/* Main */}
       <main className="max-w-5xl mx-auto px-4 py-6 space-y-6">
         <div className="flex items-center justify-between flex-wrap gap-3">
-          <p className="text-sm text-slate-600">
-            {myRequests.length} request(s) created by you
-          </p>
+          <p className="text-sm text-slate-600">{myRequests.length} request(s) created by you</p>
           <Link
             href="/purchase-requests/new"
             className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 text-white text-sm font-medium hover:bg-emerald-700"
@@ -400,14 +390,11 @@ export default function PurchaseRequestsPage() {
           </div>
         )}
 
-        {/* Needs my attention */}
         {(profile.role !== "requester" || pendingApprovals.length > 0) && (
           <section className="space-y-2">
             <div className="flex items-center gap-2 text-slate-800">
               <Clock3 className="w-4 h-4 text-amber-500" />
-              <h2 className="text-sm font-semibold uppercase tracking-wide">
-                Needs My Attention
-              </h2>
+              <h2 className="text-sm font-semibold uppercase tracking-wide">Needs My Attention</h2>
             </div>
             {pendingApprovals.length === 0 ? (
               <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">
@@ -419,24 +406,18 @@ export default function PurchaseRequestsPage() {
           </section>
         )}
 
-        {/* My requests */}
         <section className="space-y-2">
           <div className="flex items-center gap-2 text-slate-800">
             <ClipboardList className="w-4 h-4 text-sky-500" />
-            <h2 className="text-sm font-semibold uppercase tracking-wide">
-              My Requests
-            </h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wide">My Requests</h2>
           </div>
           {renderTable(myRequests)}
         </section>
 
-        {/* My history */}
         <section className="space-y-2">
           <div className="flex items-center gap-2 text-slate-800">
             <History className="w-4 h-4 text-slate-500" />
-            <h2 className="text-sm font-semibold uppercase tracking-wide">
-              My History
-            </h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wide">My History</h2>
           </div>
           {historyRequests.length === 0 ? (
             <div className="bg-white rounded-xl border shadow-sm p-4 text-sm text-slate-500">

@@ -5,15 +5,18 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { ArrowLeft, Plus, Save, Trash2, X, Search, AlertCircle } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 type CategoryRow = {
   id: string;
   name: string;
   user_id: string | null;
+  company_id?: string | null;
 };
 
 export default function CategoriesSettingsPage() {
   const router = useRouter();
+  const { loading: companyLoading, companyId } = useCompany();
 
   const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -22,37 +25,44 @@ export default function CategoriesSettingsPage() {
 
   const [rows, setRows] = useState<CategoryRow[]>([]);
   const [search, setSearch] = useState("");
-
   const [newName, setNewName] = useState("");
 
-  // editing
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
 
   useEffect(() => {
+    const init = async () => {
+      if (companyLoading) return;
+
+      setLoading(true);
+      setError(null);
+
+      const { data: userData } = await supabase.auth.getUser();
+      if (!userData?.user) {
+        router.push("/auth");
+        return;
+      }
+      setUserId(userData.user.id);
+
+      if (!companyId) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      await loadCategories(companyId);
+      setLoading(false);
+    };
+
     void init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [companyLoading, companyId]);
 
-  const init = async () => {
-    setLoading(true);
-    setError(null);
-
-    const { data: userData } = await supabase.auth.getUser();
-    if (!userData?.user) {
-      router.push("/auth");
-      return;
-    }
-    setUserId(userData.user.id);
-
-    await loadCategories();
-    setLoading(false);
-  };
-
-  const loadCategories = async () => {
+  const loadCategories = async (cid: string) => {
     const { data, error } = await supabase
       .from("categories")
-      .select("id, name, user_id")
+      .select("id, name, user_id, company_id")
+      .eq("company_id", cid)
       .order("name", { ascending: true });
 
     if (error) {
@@ -83,6 +93,11 @@ export default function CategoriesSettingsPage() {
 
   const saveEdit = async () => {
     if (!editingId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const name = editingName.trim();
     if (!name) {
       setError("Name cannot be blank.");
@@ -95,6 +110,7 @@ export default function CategoriesSettingsPage() {
     const { error } = await supabase
       .from("categories")
       .update({ name })
+      .eq("company_id", companyId)
       .eq("id", editingId);
 
     if (error) {
@@ -104,15 +120,18 @@ export default function CategoriesSettingsPage() {
       return;
     }
 
-    setRows((prev) =>
-      prev.map((r) => (r.id === editingId ? { ...r, name } : r))
-    );
+    setRows((prev) => prev.map((r) => (r.id === editingId ? { ...r, name } : r)));
     cancelEdit();
     setSaving(false);
   };
 
   const addCategory = async () => {
     if (!userId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const name = newName.trim();
     if (!name) return;
 
@@ -121,8 +140,8 @@ export default function CategoriesSettingsPage() {
 
     const { data, error } = await supabase
       .from("categories")
-      .insert({ name, user_id: userId })
-      .select("id, name, user_id")
+      .insert({ name, user_id: userId, company_id: companyId })
+      .select("id, name, user_id, company_id")
       .single();
 
     if (error || !data) {
@@ -142,13 +161,22 @@ export default function CategoriesSettingsPage() {
   };
 
   const deleteCategory = async (row: CategoryRow) => {
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     const ok = confirm(`Delete category "${row.name}"? This cannot be undone.`);
     if (!ok) return;
 
     setSaving(true);
     setError(null);
 
-    const { error } = await supabase.from("categories").delete().eq("id", row.id);
+    const { error } = await supabase
+      .from("categories")
+      .delete()
+      .eq("company_id", companyId)
+      .eq("id", row.id);
 
     if (error) {
       console.error(error);
@@ -161,10 +189,26 @@ export default function CategoriesSettingsPage() {
     setSaving(false);
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading categories...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -196,12 +240,7 @@ export default function CategoriesSettingsPage() {
           </div>
         )}
 
-        {/* Add */}
         <div className="bg-white border rounded-2xl p-5 shadow-sm">
-          <div className="flex items-center justify-between mb-3">
-            <p className="text-sm font-semibold text-slate-900">Add Category</p>
-          </div>
-
           <div className="flex flex-col sm:flex-row gap-2">
             <input
               value={newName}
@@ -221,7 +260,6 @@ export default function CategoriesSettingsPage() {
           </div>
         </div>
 
-        {/* List */}
         <div className="bg-white border rounded-2xl shadow-sm overflow-hidden">
           <div className="p-4 border-b flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
             <p className="text-sm font-semibold text-slate-900">
@@ -241,9 +279,7 @@ export default function CategoriesSettingsPage() {
 
           <div className="divide-y">
             {filtered.length === 0 ? (
-              <div className="p-6 text-sm text-slate-500 text-center">
-                No categories found.
-              </div>
+              <div className="p-6 text-sm text-slate-500 text-center">No categories found.</div>
             ) : (
               filtered.map((row) => (
                 <div key={row.id} className="p-4 flex items-center justify-between gap-3">
@@ -257,9 +293,7 @@ export default function CategoriesSettingsPage() {
                     ) : (
                       <p className="text-sm font-medium text-slate-900">{row.name}</p>
                     )}
-                    <p className="text-xs text-slate-500">
-                      {row.user_id ? "User-created" : "Shared"}
-                    </p>
+                    <p className="text-xs text-slate-500">{row.user_id ? "User-created" : "Shared"}</p>
                   </div>
 
                   <div className="flex items-center gap-2">

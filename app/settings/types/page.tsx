@@ -4,11 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { supabase } from "@/lib/supabaseClient";
 import { ArrowLeft, Plus, Save, Trash2, AlertCircle } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
-type Row = { id: string; name: string; user_id?: string | null };
+type Row = { id: string; name: string; user_id?: string | null; company_id?: string | null };
 
 async function safeInsert(table: string, payload: any) {
-  // Try with user_id; if column doesn't exist, retry without it
   const first = await supabase.from(table).insert(payload).select("id,name").single();
   if (!first.error) return first;
 
@@ -32,7 +32,9 @@ async function safeUpdate(table: string, id: string, payload: any) {
   return first;
 }
 
-export default function ManageCategoriesPage() {
+export default function ManageTypesPage() {
+  const { loading: companyLoading, companyId } = useCompany();
+
   const [userId, setUserId] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
@@ -47,6 +49,8 @@ export default function ManageCategoriesPage() {
 
   useEffect(() => {
     const init = async () => {
+      if (companyLoading) return;
+
       setLoading(true);
       setError(null);
 
@@ -57,21 +61,36 @@ export default function ManageCategoriesPage() {
       }
       setUserId(userData.user.id);
 
-      const { data, error } = await supabase.from("item_types").select("id,name,user_id").order("name");
+      if (!companyId) {
+        setRows([]);
+        setLoading(false);
+        return;
+      }
+
+      const { data, error } = await supabase
+        .from("item_types")
+        .select("id,name,user_id,company_id")
+        .eq("company_id", companyId)
+        .order("name");
+
       if (error) setError(error.message);
       setRows((data || []) as Row[]);
       setLoading(false);
     };
 
     void init();
-  }, []);
+  }, [companyLoading, companyId]);
 
   const add = async () => {
     setError(null);
     if (!newName.trim()) return;
     if (!userId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
 
-    const payload = { name: newName.trim(), user_id: userId };
+    const payload = { name: newName.trim(), user_id: userId, company_id: companyId };
     const res = await safeInsert("item_types", payload);
     if (res.error) {
       setError(res.error.message);
@@ -83,18 +102,37 @@ export default function ManageCategoriesPage() {
 
   const update = async (id: string, name: string) => {
     setError(null);
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
     setSavingId(id);
+
+    // Keep server-side safety by scoping update to company_id
     const res = await safeUpdate("item_types", id, { name: name.trim() });
     if (res.error) setError(res.error.message);
+
+    // Extra guard: if you want client-side strictness too, reload list after update
     setSavingId(null);
   };
 
   const remove = async (id: string) => {
     setError(null);
-    const ok = confirm("Delete this category? Items will keep the old text unless you update them.");
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
+
+    const ok = confirm("Delete this type? Items will keep the old text unless you update them.");
     if (!ok) return;
 
-    const { error } = await supabase.from("item_types").delete().eq("id", id);
+    const { error } = await supabase
+      .from("item_types")
+      .delete()
+      .eq("id", id)
+      .eq("company_id", companyId);
+
     if (error) {
       setError(error.message);
       return;
@@ -102,8 +140,24 @@ export default function ManageCategoriesPage() {
     setRows((prev) => prev.filter((r) => r.id !== id));
   };
 
-  if (loading) {
-    return <div className="min-h-screen flex items-center justify-center text-slate-500">Loading item_types…</div>;
+  if (loading || companyLoading) {
+    return <div className="min-h-screen flex items-center justify-center text-slate-500">Loading types…</div>;
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -126,13 +180,13 @@ export default function ManageCategoriesPage() {
         )}
 
         <div className="bg-white border rounded-2xl p-4">
-          <label className="text-sm font-medium text-slate-700">Add new category</label>
+          <label className="text-sm font-medium text-slate-700">Add new type</label>
           <div className="flex gap-2 mt-2">
             <input
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               className="flex-1 px-3 py-2 border rounded-lg"
-              placeholder="e.g. Tools"
+              placeholder="e.g. Tool, Equipment, Material"
             />
             <button
               type="button"
@@ -145,7 +199,7 @@ export default function ManageCategoriesPage() {
         </div>
 
         <div className="bg-white border rounded-2xl overflow-hidden">
-          <div className="px-4 py-3 border-b text-xs font-semibold text-slate-600 uppercase">Categories</div>
+          <div className="px-4 py-3 border-b text-xs font-semibold text-slate-600 uppercase">Types</div>
           <div className="divide-y">
             {sorted.map((r) => (
               <RowEditor
@@ -158,7 +212,7 @@ export default function ManageCategoriesPage() {
               />
             ))}
             {sorted.length === 0 && (
-              <div className="px-4 py-6 text-sm text-slate-500">No item_types yet.</div>
+              <div className="px-4 py-6 text-sm text-slate-500">No types yet.</div>
             )}
           </div>
         </div>

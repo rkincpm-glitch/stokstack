@@ -15,15 +15,18 @@ import {
   Boxes,
   Info,
 } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 type Project = {
   id: string;
   name: string;
   code: string | null;
+  company_id?: string | null;
 };
 
 type PurchaseRequest = {
   id: string;
+  company_id?: string | null;
   pur_number: string | null;
   project_id: string | null;
   requested_by: string | null;
@@ -43,6 +46,7 @@ type PurchaseRequest = {
 
 type RequestItem = {
   id: string;
+  company_id?: string | null;
   request_id: string;
   item_id: string | null;
   description: string;
@@ -53,7 +57,7 @@ type RequestItem = {
   status: string; // pending, approved, rejected
   reject_comment: string | null;
   resubmit_comment: string | null;
-  approved_qty: number | null; // NEW: partial approval
+  approved_qty: number | null;
 };
 
 type Profile = {
@@ -76,6 +80,8 @@ export default function PurchaseRequestDetailPage() {
   const params = useParams();
   const requestId = params?.id as string;
 
+  const { loading: companyLoading, companyId } = useCompany();
+
   const [userId, setUserId] = useState<string | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
 
@@ -90,13 +96,18 @@ export default function PurchaseRequestDetailPage() {
   const [items, setItems] = useState<RequestItem[]>([]);
   const [showTechnical, setShowTechnical] = useState(false);
 
-  // UUID guard
   const uuidRegex =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const invalidId = !uuidRegex.test(requestId);
 
   useEffect(() => {
     const init = async () => {
+      if (companyLoading) return;
+
+      setLoading(true);
+      setErrorMsg(null);
+      setInfoMsg(null);
+
       const { data: userData } = await supabase.auth.getUser();
       if (!userData?.user) {
         router.push("/auth");
@@ -106,40 +117,44 @@ export default function PurchaseRequestDetailPage() {
       const uid = userData.user.id;
       setUserId(uid);
 
-      // Profile
+      // Profile (not tenant-scoped)
       const { data: profData } = await supabase
         .from("profiles")
         .select("id, role, display_name")
         .eq("id", uid)
         .maybeSingle();
 
-      let role = "requester";
-      let displayName: string | null = null;
-      if (profData) {
-        role = profData.role || "requester";
-        displayName = profData.display_name || null;
-      }
-
+      const role = profData?.role || "requester";
+      const displayName = profData?.display_name || null;
       setProfile({ id: uid, role, display_name: displayName });
 
+      if (!companyId) {
+        setRequest(null);
+        setProject(null);
+        setItems([]);
+        setLoading(false);
+        return;
+      }
+
       if (!invalidId) {
-        await loadRequest();
+        await loadRequest(companyId);
       }
 
       setLoading(false);
     };
 
-    init();
+    void init();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [requestId]);
+  }, [requestId, companyLoading, companyId]);
 
-  const loadRequest = async () => {
+  const loadRequest = async (cid: string) => {
     setErrorMsg(null);
     setInfoMsg(null);
 
     const { data: reqData, error: reqError } = await supabase
       .from("purchase_requests")
       .select("*")
+      .eq("company_id", cid)
       .eq("id", requestId)
       .single();
 
@@ -159,27 +174,26 @@ export default function PurchaseRequestDetailPage() {
     if (reqData.project_id) {
       const { data: projData } = await supabase
         .from("projects")
-        .select("id, name, code")
+        .select("id, name, code, company_id")
+        .eq("company_id", cid)
         .eq("id", reqData.project_id)
         .single();
 
-      if (projData) {
-        setProject(projData as Project);
-      }
+      setProject(projData ? (projData as Project) : null);
+    } else {
+      setProject(null);
     }
 
     const { data: itemsData, error: itemsError } = await supabase
       .from("purchase_request_items")
       .select("*")
+      .eq("company_id", cid)
       .eq("request_id", requestId)
       .order("created_at", { ascending: true });
 
-    if (!itemsError && itemsData) {
-      setItems(itemsData as RequestItem[]);
-    }
+    if (!itemsError && itemsData) setItems(itemsData as RequestItem[]);
   };
 
-  // who can advance what?
   const canApproveReject =
     profile &&
     request &&
@@ -195,8 +209,7 @@ export default function PurchaseRequestDetailPage() {
   const canMarkReceived =
     profile && request && profile.role === "purchaser" && request.status === "purchased";
 
-  const canReceiveToStock =
-    profile && request && request.status === "received";
+  const canReceiveToStock = profile && request && request.status === "received";
 
   const logEvent = async (opts: {
     event_type: string;
@@ -205,9 +218,10 @@ export default function PurchaseRequestDetailPage() {
     item_id?: string | null;
     comment?: string | null;
   }) => {
-    if (!userId || !request) return;
+    if (!userId || !request || !companyId) return;
 
     await supabase.from("purchase_request_events").insert({
+      company_id: companyId,
       request_id: request.id,
       item_id: opts.item_id || null,
       performed_by: userId,
@@ -219,7 +233,7 @@ export default function PurchaseRequestDetailPage() {
   };
 
   const updateRequestStatus = async (nextStatus: string, comment?: string) => {
-    if (!request || !userId) return;
+    if (!request || !userId || !companyId) return;
 
     setSavingStatus(true);
     setErrorMsg(null);
@@ -247,6 +261,7 @@ export default function PurchaseRequestDetailPage() {
     const { error } = await supabase
       .from("purchase_requests")
       .update(payload)
+      .eq("company_id", companyId)
       .eq("id", request.id);
 
     if (error) {
@@ -263,7 +278,7 @@ export default function PurchaseRequestDetailPage() {
       comment: comment || null,
     });
 
-    await loadRequest();
+    await loadRequest(companyId);
     setSavingStatus(false);
     setInfoMsg(`Status updated to ${STATUS_LABEL[nextStatus] || nextStatus}.`);
   };
@@ -279,14 +294,10 @@ export default function PurchaseRequestDetailPage() {
     if (action === "approve") {
       if (profile.role === "pm" && request.status === "submitted") {
         nextStatus = "pm_approved";
-      } else if (
-        profile.role === "president" &&
-        request.status === "pm_approved"
-      ) {
+      } else if (profile.role === "president" && request.status === "pm_approved") {
         nextStatus = "president_approved";
       }
     } else {
-      // reject whole request
       const c = window.prompt("Enter rejection reason for this request:");
       if (!c || !c.trim()) {
         alert("Rejection reason is required.");
@@ -299,19 +310,14 @@ export default function PurchaseRequestDetailPage() {
     await updateRequestStatus(nextStatus, comment);
   };
 
-  const handleItemDecision = async (
-    item: RequestItem,
-    action: "approve" | "reject"
-  ) => {
-    if (!profile) return;
+  const handleItemDecision = async (item: RequestItem, action: "approve" | "reject") => {
+    if (!profile || !companyId) return;
 
     let comment: string | null = null;
     let approvedQty: number | null = item.approved_qty ?? item.quantity;
 
     if (action === "reject") {
-      const c = window.prompt(
-        "Enter rejection comment for this line item (required):"
-      );
+      const c = window.prompt("Enter rejection comment for this line item (required):");
       if (!c || !c.trim()) {
         alert("Rejection comment is required.");
         return;
@@ -319,26 +325,16 @@ export default function PurchaseRequestDetailPage() {
       comment = c.trim();
       approvedQty = 0;
     } else {
-      // Approve (full or partial)
-      const defaultQty =
-        approvedQty && approvedQty > 0 ? approvedQty : item.quantity;
+      const defaultQty = approvedQty && approvedQty > 0 ? approvedQty : item.quantity;
       const qtyStr = window.prompt(
         `Enter approved quantity (<= ${item.quantity}):`,
         String(defaultQty)
       );
-      if (!qtyStr) {
-        // user cancelled
-        return;
-      }
+      if (!qtyStr) return;
+
       const qtyNum = Number(qtyStr);
-      if (
-        Number.isNaN(qtyNum) ||
-        qtyNum <= 0 ||
-        qtyNum > Number(item.quantity)
-      ) {
-        alert(
-          `Approved quantity must be a number between 1 and ${item.quantity}.`
-        );
+      if (Number.isNaN(qtyNum) || qtyNum <= 0 || qtyNum > Number(item.quantity)) {
+        alert(`Approved quantity must be a number between 1 and ${item.quantity}.`);
         return;
       }
       approvedQty = qtyNum;
@@ -361,15 +357,14 @@ export default function PurchaseRequestDetailPage() {
       .from("purchase_request_items")
       .update({
         status: newStatus,
-        approved_qty:
-          action === "approve" ? approvedQty : 0,
-        reject_comment:
-          action === "reject" ? comment : item.reject_comment,
+        approved_qty: action === "approve" ? approvedQty : 0,
+        reject_comment: action === "reject" ? comment : item.reject_comment,
         resubmit_comment:
           action === "approve" && item.status === "rejected"
             ? comment
             : item.resubmit_comment,
       })
+      .eq("company_id", companyId)
       .eq("id", item.id);
 
     if (error) {
@@ -384,49 +379,51 @@ export default function PurchaseRequestDetailPage() {
       comment: comment,
     });
 
-    await loadRequest();
+    await loadRequest(companyId);
   };
 
   const handleReceiveToStock = async () => {
-    if (!request || !userId) return;
+    if (!request || !userId || !companyId) return;
 
     setStocking(true);
     setErrorMsg(null);
     setInfoMsg(null);
 
     try {
-      const freshItems = items;
+      for (const it of items) {
+        if (it.status === "rejected") continue;
 
-      for (const it of freshItems) {
-        if (it.status === "rejected") {
-          continue; // don't stock rejected lines
-        }
-
-        const effectiveQty =
-          it.approved_qty != null ? it.approved_qty : it.quantity;
-
-        if (!effectiveQty || effectiveQty <= 0) {
-          continue;
-        }
+        const effectiveQty = it.approved_qty != null ? it.approved_qty : it.quantity;
+        if (!effectiveQty || effectiveQty <= 0) continue;
 
         if (it.item_id) {
-          // existing inventory item → increment quantity
-          await supabase
+          // existing inventory item → increment quantity (safer: fetch current and add)
+          const { data: existing, error: exErr } = await supabase
             .from("items")
-            .update({
-              quantity: effectiveQty,
-            })
+            .select("id, quantity")
+            .eq("company_id", companyId)
             .eq("id", it.item_id)
-            .then(({ error }) => {
-              if (error) {
-                console.error("Error updating stock item:", error);
-              }
-            });
+            .maybeSingle();
+
+          if (exErr || !existing) {
+            console.error("Error loading stock item:", exErr);
+            continue;
+          }
+
+          const currentQty = Number(existing.quantity || 0);
+          const { error: upErr } = await supabase
+            .from("items")
+            .update({ quantity: currentQty + effectiveQty })
+            .eq("company_id", companyId)
+            .eq("id", it.item_id);
+
+          if (upErr) console.error("Error updating stock item:", upErr);
         } else {
           // new inventory item
           const { data: newItem, error: newErr } = await supabase
             .from("items")
             .insert({
+              company_id: companyId,
               user_id: userId,
               name: it.description,
               description: request.notes,
@@ -437,16 +434,16 @@ export default function PurchaseRequestDetailPage() {
               purchase_price: it.est_unit_price,
               purchase_date: new Date().toISOString().slice(0, 10),
             })
-            .select()
+            .select("id")
             .single();
 
           if (newErr) {
             console.error("Error creating inventory item:", newErr);
           } else if (newItem) {
-            // back-link line item → inventory item
             await supabase
               .from("purchase_request_items")
               .update({ item_id: newItem.id })
+              .eq("company_id", companyId)
               .eq("id", it.id);
           }
         }
@@ -458,7 +455,7 @@ export default function PurchaseRequestDetailPage() {
       });
 
       setInfoMsg("Items added/updated in Stokstak inventory.");
-    } catch (err: any) {
+    } catch (err) {
       console.error(err);
       setErrorMsg("Error receiving into stock. See console for details.");
     } finally {
@@ -467,10 +464,26 @@ export default function PurchaseRequestDetailPage() {
   };
 
   // Render states
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading request...
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/purchase-requests" className="text-blue-600 hover:underline">
+              Back to requests
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -500,15 +513,12 @@ export default function PurchaseRequestDetailPage() {
 
   const canActOnItem =
     (profile &&
-      request &&
       ((profile.role === "pm" && request.status === "submitted") ||
-        (profile.role === "president" &&
-          request.status === "pm_approved"))) ||
+        (profile.role === "president" && request.status === "pm_approved"))) ||
     profile?.role === "admin";
 
   return (
     <div className="min-h-screen bg-slate-50">
-      {/* Header */}
       <header className="bg-white border-b border-slate-200">
         <div className="max-w-4xl mx-auto px-4 h-16 flex items-center justify-between">
           <Link
@@ -536,7 +546,6 @@ export default function PurchaseRequestDetailPage() {
         </div>
       </header>
 
-      {/* Main */}
       <main className="max-w-4xl mx-auto px-4 py-6 space-y-6">
         {errorMsg && (
           <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 flex items-center gap-2">
@@ -551,7 +560,6 @@ export default function PurchaseRequestDetailPage() {
           </div>
         )}
 
-        {/* Project & status card */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
           <div className="flex items-start justify-between gap-3">
             <div>
@@ -559,9 +567,7 @@ export default function PurchaseRequestDetailPage() {
               <h1 className="text-lg font-semibold text-slate-900 flex items-center gap-2">
                 {project?.name || "No project"}
                 {project?.code && (
-                  <span className="text-xs text-slate-500">
-                    ({project.code})
-                  </span>
+                  <span className="text-xs text-slate-500">({project.code})</span>
                 )}
               </h1>
 
@@ -586,9 +592,7 @@ export default function PurchaseRequestDetailPage() {
                 <CheckCircle2 className="w-3 h-3" />
                 {currentStatusLabel}
               </span>
-              <p className="text-[11px] text-slate-500">
-                Created: {request.created_at.slice(0, 10)}
-              </p>
+              <p className="text-[11px] text-slate-500">Created: {request.created_at.slice(0, 10)}</p>
               {request.needed_by && (
                 <p className="text-[11px] text-slate-500 flex items-center gap-1">
                   <Calendar className="w-3 h-3" />
@@ -600,14 +604,11 @@ export default function PurchaseRequestDetailPage() {
 
           {request.notes && (
             <div className="bg-slate-50 rounded-xl p-3 text-sm text-slate-700">
-              <span className="font-semibold text-xs text-slate-500">
-                Notes:
-              </span>
+              <span className="font-semibold text-xs text-slate-500">Notes:</span>
               <p>{request.notes}</p>
             </div>
           )}
 
-          {/* Approver actions */}
           <div className="pt-3 border-t flex flex-wrap items-center gap-3 justify-between">
             <p className="text-xs text-slate-500">
               Use the actions below to move this request through the workflow.
@@ -672,7 +673,6 @@ export default function PurchaseRequestDetailPage() {
           </div>
         </section>
 
-        {/* Line items */}
         <section className="bg-white rounded-2xl shadow-sm border p-4 sm:p-6 space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-slate-800 uppercase tracking-wide">
@@ -685,46 +685,27 @@ export default function PurchaseRequestDetailPage() {
           </div>
 
           {items.length === 0 ? (
-            <p className="text-sm text-slate-500">
-              No line items found for this request.
-            </p>
+            <p className="text-sm text-slate-500">No line items found for this request.</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-slate-50 border-b">
                   <tr>
-                    <th className="text-left px-3 py-2 font-medium">
-                      Description
-                    </th>
-                    <th className="text-left px-3 py-2 font-medium">
-                      Location
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Requested
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Approved
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Est. Unit
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Est. Total
-                    </th>
-                    <th className="text-left px-3 py-2 font-medium">
-                      Status
-                    </th>
-                    <th className="text-right px-3 py-2 font-medium">
-                      Actions
-                    </th>
+                    <th className="text-left px-3 py-2 font-medium">Description</th>
+                    <th className="text-left px-3 py-2 font-medium">Location</th>
+                    <th className="text-right px-3 py-2 font-medium">Requested</th>
+                    <th className="text-right px-3 py-2 font-medium">Approved</th>
+                    <th className="text-right px-3 py-2 font-medium">Est. Unit</th>
+                    <th className="text-right px-3 py-2 font-medium">Est. Total</th>
+                    <th className="text-left px-3 py-2 font-medium">Status</th>
+                    <th className="text-right px-3 py-2 font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {items.map((it) => {
                     const unit = it.unit || "ea";
                     const unitPrice = it.est_unit_price || 0;
-                    const lineTotal =
-                      unitPrice * Number(it.quantity || 0);
+                    const lineTotal = unitPrice * Number(it.quantity || 0);
 
                     const statusBadge =
                       it.status === "approved"
@@ -733,8 +714,7 @@ export default function PurchaseRequestDetailPage() {
                         ? "bg-red-100 text-red-700"
                         : "bg-slate-100 text-slate-700";
 
-                    const approvedQty =
-                      it.approved_qty != null ? it.approved_qty : null;
+                    const approvedQty = it.approved_qty != null ? it.approved_qty : null;
                     const isPartial =
                       approvedQty != null &&
                       approvedQty > 0 &&
@@ -744,9 +724,7 @@ export default function PurchaseRequestDetailPage() {
                       <tr key={it.id} className="border-b last:border-0">
                         <td className="px-3 py-2 align-top">
                           <div className="flex flex-col gap-0.5">
-                            <span className="font-medium text-slate-900">
-                              {it.description}
-                            </span>
+                            <span className="font-medium text-slate-900">{it.description}</span>
                             {it.item_id && (
                               <span className="text-[10px] text-slate-500">
                                 Linked stock item: {it.item_id}
@@ -775,18 +753,10 @@ export default function PurchaseRequestDetailPage() {
                         </td>
                         <td className="px-3 py-2 align-top text-right">
                           {approvedQty != null ? (
-                            <span
-                              className={
-                                isPartial
-                                  ? "text-amber-700 font-semibold"
-                                  : "text-slate-800"
-                              }
-                            >
+                            <span className={isPartial ? "text-amber-700 font-semibold" : "text-slate-800"}>
                               {approvedQty} {unit}
                               {isPartial && (
-                                <span className="ml-1 text-[10px] text-amber-600">
-                                  (partial)
-                                </span>
+                                <span className="ml-1 text-[10px] text-amber-600">(partial)</span>
                               )}
                             </span>
                           ) : (
@@ -800,9 +770,7 @@ export default function PurchaseRequestDetailPage() {
                           {lineTotal ? `$${lineTotal.toFixed(2)}` : "-"}
                         </td>
                         <td className="px-3 py-2 align-top">
-                          <span
-                            className={`inline-flex px-2 py-0.5 rounded-full ${statusBadge}`}
-                          >
+                          <span className={`inline-flex px-2 py-0.5 rounded-full ${statusBadge}`}>
                             {it.status}
                           </span>
                         </td>
@@ -811,18 +779,14 @@ export default function PurchaseRequestDetailPage() {
                             <div className="flex flex-col gap-1 items-end">
                               <button
                                 type="button"
-                                onClick={() =>
-                                  handleItemDecision(it, "approve")
-                                }
+                                onClick={() => handleItemDecision(it, "approve")}
                                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
                               >
                                 Approve / Partial
                               </button>
                               <button
                                 type="button"
-                                onClick={() =>
-                                  handleItemDecision(it, "reject")
-                                }
+                                onClick={() => handleItemDecision(it, "reject")}
                                 className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] bg-red-50 text-red-700 hover:bg-red-100"
                               >
                                 Reject
@@ -841,8 +805,7 @@ export default function PurchaseRequestDetailPage() {
           {items.length > 0 && !items.some((i) => i.est_unit_price) && (
             <div className="mt-3 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-[11px] text-amber-800 flex items-center gap-2">
               <AlertCircle className="w-3 h-3" />
-              No estimated prices entered; total is 0. Approvers may still use
-              this for scope/quantity only.
+              No estimated prices entered; total is 0. Approvers may still use this for scope/quantity only.
             </div>
           )}
         </section>

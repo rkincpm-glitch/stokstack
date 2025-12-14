@@ -16,6 +16,7 @@ import {
   X,
   AlertCircle,
 } from "lucide-react";
+import { useCompany } from "@/lib/useCompany";
 
 const ADD_CATEGORY = "__ADD_CATEGORY__";
 const ADD_LOCATION = "__ADD_LOCATION__";
@@ -65,6 +66,7 @@ async function safeInsertMaster(
 
 export default function AddItemPage() {
   const router = useRouter();
+  const { loading: companyLoading, companyId } = useCompany();
 
   const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -101,6 +103,9 @@ export default function AddItemPage() {
 
   useEffect(() => {
     const init = async () => {
+      // Wait for company context first
+      if (companyLoading) return;
+
       setLoading(true);
       setError(null);
 
@@ -114,10 +119,18 @@ export default function AddItemPage() {
         }
         setUserId(user.id);
 
+        if (!companyId) {
+          setCategories([]);
+          setLocations([]);
+          setItemTypes([]);
+          setLoading(false);
+          return;
+        }
+
         const [cats, locs, types] = await Promise.all([
-          supabase.from("categories").select("id,name").order("name"),
-          supabase.from("locations").select("id,name").order("name"),
-          supabase.from("item_types").select("id,name").order("name"),
+          supabase.from("categories").select("id,name").eq("company_id", companyId).order("name"),
+          supabase.from("locations").select("id,name").eq("company_id", companyId).order("name"),
+          supabase.from("item_types").select("id,name").eq("company_id", companyId).order("name"),
         ]);
 
         if (cats.error) throw cats.error;
@@ -139,16 +152,16 @@ export default function AddItemPage() {
     };
 
     void init();
-  }, [router]);
+  }, [router, companyLoading, companyId]);
 
   const addMasterItem = async (
     table: "categories" | "locations" | "item_types",
     name: string
   ): Promise<{ id: string; name: string } | null> => {
-    if (!userId || !name.trim()) return null;
+    if (!userId || !companyId || !name.trim()) return null;
 
     setError(null);
-    const payload = { name: name.trim(), user_id: userId };
+    const payload = { name: name.trim(), user_id: userId, company_id: companyId };
 
     const { data, error } = await safeInsertMaster(table, payload);
     if (error || !data) {
@@ -279,6 +292,10 @@ export default function AddItemPage() {
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!userId) return;
+    if (!companyId) {
+      setError("No company assigned to this user.");
+      return;
+    }
 
     setError(null);
     setSuccess(false);
@@ -303,13 +320,14 @@ export default function AddItemPage() {
       const { data: item, error: insertError } = await supabase
         .from("items")
         .insert({
+          company_id: companyId,
           user_id: userId,
           name: form.name.trim(),
-          te_number: form.teNumber.trim() || null, // optional
+          te_number: form.teNumber.trim() || null,
           description: form.description.trim() || null,
-          type: form.type, // mandatory
-          category: form.category, // mandatory
-          location: form.location, // mandatory
+          type: form.type,
+          category: form.category,
+          location: form.location,
           quantity: quantityNum,
           image_url: imageUrl,
           image_url_2: imageUrl2,
@@ -327,6 +345,7 @@ export default function AddItemPage() {
 
       if (form.verifyOnCreate && item.id) {
         await supabase.from("stock_verifications").insert({
+          company_id: companyId,
           item_id: item.id,
           verified_at: new Date().toISOString().slice(0, 10),
           verified_qty: quantityNum,
@@ -360,10 +379,26 @@ export default function AddItemPage() {
     }
   };
 
-  if (loading) {
+  if (loading || companyLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-slate-500">
         Loading…
+      </div>
+    );
+  }
+
+  if (!companyId) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center px-4">
+        <div className="bg-white border rounded-xl p-4 text-sm text-slate-700 max-w-md w-full">
+          No company assigned to this user. Please add this user to a company in{" "}
+          <code>company_users</code>.
+          <div className="mt-3">
+            <Link href="/" className="text-blue-600 hover:underline">
+              Back to dashboard
+            </Link>
+          </div>
+        </div>
       </div>
     );
   }
@@ -494,7 +529,7 @@ export default function AddItemPage() {
             </h2>
 
             <div className="grid gap-5 sm:grid-cols-3">
-              {/* Type (MANDATORY) */}
+              {/* Type */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -524,7 +559,7 @@ export default function AddItemPage() {
                 </select>
               </div>
 
-              {/* Category (MANDATORY) */}
+              {/* Category */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
@@ -554,7 +589,7 @@ export default function AddItemPage() {
                 </select>
               </div>
 
-              {/* Location (MANDATORY) */}
+              {/* Location */}
               <div>
                 <div className="flex justify-between items-center mb-1">
                   <label className="text-sm font-medium text-slate-700">
